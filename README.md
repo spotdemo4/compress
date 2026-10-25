@@ -1,5 +1,28 @@
 # compress
 
+> [!NOTE]
+> **This is a fork of [klauspost/compress](https://github.com/klauspost/compress).**
+> Its `master` branch is upstream `master` with two zstd changes merged in
+> that are still under review upstream. Each lives on its own branch:
+>
+> * [`zstd-dict-small-blocks`](https://github.com/spotdemo4/compress/tree/zstd-dict-small-blocks)
+>   ([#1280](https://github.com/klauspost/compress/pull/1280)): faster and
+>   smaller small frames with dictionaries. Fresh Huffman and FSE tables are
+>   no longer built when they can't beat the dictionary's tables, and huff0
+>   counts a new table's header when choosing whether to reuse one. Encoding
+>   small messages with a dictionary is 35–50% faster at `SpeedFastest`, and
+>   frames are 2–13% smaller at every level.
+> * [`zstd-magicless-dictid`](https://github.com/spotdemo4/compress/tree/zstd-magicless-dictid)
+>   ([#1281](https://github.com/klauspost/compress/pull/1281)): magicless
+>   frames and frames without a dictionary ID. Adds `WithEncoderMagicless`,
+>   `WithDecoderMagicless` and `WithEncoderDictID(false)`, and lets
+>   `WithDecoderDefaultDict` load a full zstd dictionary for frames that
+>   carry no ID, matching libzstd's `ZSTD_f_zstd1_magicless` and
+>   `--no-dictID`.
+>
+> Use it with a `replace` directive:
+> `go mod edit -replace github.com/klauspost/compress=github.com/spotdemo4/compress@master`.
+
 This package provides various compression algorithms.
 
 * [zstandard](https://github.com/klauspost/compress/tree/master/zstd#zstd) compression and decompression in pure Go.
