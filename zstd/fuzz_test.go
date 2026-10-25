@@ -57,6 +57,14 @@ func FuzzDecodeAll(f *testing.F) {
 			t.Fatalf("Output mismatch, low: %v, hi: %v", err1, err2)
 		}
 
+		// Decode as magicless frames, without the magic number if present.
+		decML, err := NewReader(nil, WithDecoderMagicless(true), WithDecoderConcurrency(1), WithDecoderMaxMemory(20<<20), WithDecoderMaxWindow(1<<20), IgnoreChecksum(true))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer decML.Close()
+		_, _ = decML.DecodeAll(bytes.TrimPrefix(b, []byte(frameMagic)), nil)
+
 		if compareNonAsm && cpuinfo.HasBMI2() {
 			// Decode again with the BMI2 assembly disabled and require identical
 			// output, exercising the assembly against the non-assembly path.
@@ -166,6 +174,9 @@ func FuzzEncoding(f *testing.F) {
 	var dec *Decoder
 	var encs [SpeedBestCompression + 1]*Encoder
 	var encsD [SpeedBestCompression + 1]*Encoder
+	// Magicless, without dictionary ID.
+	var encsML [SpeedBestCompression + 1]*Encoder
+	var decsML [SpeedBestCompression + 1]*Decoder
 
 	var dicts [][]byte
 	if testDicts {
@@ -187,6 +198,17 @@ func FuzzEncoding(f *testing.F) {
 			encs[level], err = NewWriter(nil, WithEncoderCRC(true), WithEncoderLevel(level), WithEncoderConcurrency(2), WithWindowSize(64<<10), WithZeroFrames(true), WithLowerEncoderMem(true))
 			if testDicts {
 				encsD[level], err = NewWriter(nil, WithEncoderCRC(true), WithEncoderLevel(level), WithEncoderConcurrency(2), WithWindowSize(64<<10), WithZeroFrames(true), WithEncoderDict(dicts[int(level)%len(dicts)]), WithLowerEncoderMem(true), WithLowerEncoderMem(true))
+				if err != nil {
+					panic(err)
+				}
+				encsML[level], err = NewWriter(nil, WithEncoderCRC(true), WithEncoderLevel(level), WithEncoderConcurrency(2), WithWindowSize(64<<10), WithZeroFrames(true), WithEncoderDict(dicts[int(level)%len(dicts)]), WithLowerEncoderMem(true), WithEncoderMagicless(true), WithEncoderDictID(false))
+				if err != nil {
+					panic(err)
+				}
+				decsML[level], err = NewReader(nil, WithDecoderConcurrency(2), WithDecoderDefaultDict(dicts[int(level)%len(dicts)]), WithDecoderMagicless(true), WithDecoderMaxWindow(64<<10), WithDecoderMaxMemory(uint64(*fuzzMaxF)))
+				if err != nil {
+					panic(err)
+				}
 			}
 		}
 		return func() {
@@ -200,6 +222,16 @@ func FuzzEncoding(f *testing.F) {
 				for _, enc := range encsD {
 					if enc != nil {
 						enc.Close()
+					}
+				}
+				for _, enc := range encsML {
+					if enc != nil {
+						enc.Close()
+					}
+				}
+				for _, dec := range decsML {
+					if dec != nil {
+						dec.Close()
 					}
 				}
 			}
@@ -296,6 +328,18 @@ func FuzzEncoding(f *testing.F) {
 			}
 			if !bytes.Equal(got, data) {
 				t.Fatal(fmt.Sprintln("Dict Level", level, "DecodeAll output mismatch\n", len(got), "org: \n", len(data), "(want)", "\nencoded:", len(encoded)))
+			}
+
+			encodedML := encsML[level].EncodeAll(data, nil)
+			if !bytes.Equal(stripDictID(encoded)[4:], encodedML) {
+				t.Fatal(fmt.Sprintln("Dict Level", level, "magicless frame without dictionary ID differs from stripped frame"))
+			}
+			got, err = decsML[level].DecodeAll(encodedML, got[:0])
+			if err != nil {
+				t.Fatal(fmt.Sprintln("Dict Level", level, "magicless DecodeAll error:", err, "\norg:", len(data), "\nencoded", len(encodedML)))
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatal(fmt.Sprintln("Dict Level", level, "magicless DecodeAll output mismatch\n", len(got), "org: \n", len(data), "(want)", "\nencoded:", len(encodedML)))
 			}
 
 			err = enc.Close()

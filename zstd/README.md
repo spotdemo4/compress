@@ -375,6 +375,13 @@ and it will likely be used even if it doesn't improve compression.
 
 The used dictionary must be used to decompress the content.
 
+`WithEncoderDictID(false)` leaves the dictionary ID out of the frame header, like `zstd --no-dictID`.
+To decompress such frames, register the dictionary with `WithDecoderDefaultDict(dict []byte)`,
+which is used for all frames without a dictionary ID.
+
+For very small payloads, `WithEncoderMagicless(true)` leaves out the 4-byte magic number
+at the start of each frame. The output can only be decompressed with `WithDecoderMagicless(true)`.
+
 For any real gains, the dictionary should be built with similar data. 
 If an unsuitable dictionary is used the output may be slightly larger than using no dictionary.
 Use the [zstd commandline tool](https://github.com/facebook/zstd/releases) to build a dictionary from sample data.
