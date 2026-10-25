@@ -516,6 +516,93 @@ func TestCompress1XReuse(t *testing.T) {
 	}
 }
 
+func TestCompress1XReuseCountsTable(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	letters := func(n, skew int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = 'a' + byte(rng.Intn(26))
+			if rng.Intn(skew) == 0 {
+				b[i] = 'a' + byte(rng.Intn(4))
+			}
+		}
+		return b
+	}
+	prev := letters(4096, 1000)
+	smaller := 0
+	for i := range 100 {
+		in := letters(200, 3)
+		size := func(p ReusePolicy) int {
+			var s Scratch
+			if _, _, err := Compress1X(prev, &s); err != nil {
+				t.Fatal(err)
+			}
+			s.Reuse = p
+			out, _, err := Compress1X(in, &s)
+			if err != nil {
+				t.Fatal(i, p, err)
+			}
+			return len(out)
+		}
+		reused, fresh, got := size(ReusePolicyPrefer), size(ReusePolicyNone), size(ReusePolicyAllow)
+		if got > min(reused, fresh) {
+			t.Fatalf("%d: got %d bytes, reusing gives %d and a new table %d", i, got, reused, fresh)
+		}
+		if reused < fresh {
+			smaller++
+		}
+	}
+	if smaller == 0 {
+		t.Fatal("reusing never wins; the test needs other input")
+	}
+}
+
+func TestCompressPreferFallback(t *testing.T) {
+	// The previous table has long codes for 1-4, so reusing it is rejected
+	// and a new table must be used.
+	prev := []byte(strings.Repeat("the quick brown fox jumps over the lazy dog ", 100) + "\x01\x02\x03\x04")
+	rng := rand.New(rand.NewSource(1))
+	in := make([]byte, 2000)
+	for i := range in {
+		in[i] = 1 + byte(rng.Intn(4))
+	}
+	for _, tc := range []struct {
+		name string
+		comp func([]byte, *Scratch) ([]byte, bool, error)
+		dec  func(*Scratch, []byte, int) ([]byte, error)
+		in   []byte
+	}{
+		{"1X", Compress1X, func(s *Scratch, b []byte, _ int) ([]byte, error) { return s.Decompress1X(b) }, in[:500]},
+		{"4X", Compress4X, (*Scratch).Decompress4X, in},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var s Scratch
+			if _, _, err := tc.comp(prev, &s); err != nil {
+				t.Fatal(err)
+			}
+			s.Reuse = ReusePolicyPrefer
+			out, reUsed, err := tc.comp(tc.in, &s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reUsed {
+				t.Fatal("reused a table with long codes")
+			}
+			dt, rem, err := ReadTable(out, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := tc.dec(dt, rem, len(tc.in))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, tc.in) {
+				t.Fatal("output mismatch")
+			}
+		})
+	}
+}
+
 func BenchmarkDeflate(b *testing.B) {
 	for _, tt := range testfiles {
 		test := tt
