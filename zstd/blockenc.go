@@ -355,18 +355,21 @@ func (b *blockEnc) encodeLits(lits []byte, raw bool) error {
 		reUsed, single bool
 		err            error
 	)
-	if b.dictLitEnc != nil {
-		b.litEnc.TransferCTable(b.dictLitEnc)
-		b.litEnc.Reuse = huff0.ReusePolicyAllow
-		b.dictLitEnc = nil
-	}
+	fromDict := b.useDictLits()
 	if len(lits) >= 1024 {
 		// Use 4 Streams.
 		out, reUsed, err = huff0.Compress4X(lits, b.litEnc)
 	} else if len(lits) > 16 {
 		// Use 1 stream
 		single = true
+		if fromDict {
+			// Like zstd, prefer the dictionary table for small inputs.
+			b.litEnc.Reuse = huff0.ReusePolicyPrefer
+		}
 		out, reUsed, err = huff0.Compress1X(lits, b.litEnc)
+		if fromDict {
+			b.litEnc.Reuse = huff0.ReusePolicyAllow
+		}
 	} else {
 		err = huff0.ErrIncompressible
 	}
@@ -427,6 +430,18 @@ func (b *blockEnc) encodeLits(lits []byte, raw bool) error {
 	// No sequences.
 	b.output = append(b.output, 0)
 	return nil
+}
+
+// useDictLits makes the dictionary literal table, if any, the previous table.
+// It reports whether there was one.
+func (b *blockEnc) useDictLits() bool {
+	if b.dictLitEnc == nil {
+		return false
+	}
+	b.litEnc.TransferCTable(b.dictLitEnc)
+	b.litEnc.Reuse = huff0.ReusePolicyAllow
+	b.dictLitEnc = nil
+	return true
 }
 
 // encodeRLE will encode an RLE block.
@@ -515,18 +530,21 @@ func (b *blockEnc) encode(org []byte, raw, rawAllLits bool) error {
 		reUsed, single bool
 		err            error
 	)
-	if b.dictLitEnc != nil {
-		b.litEnc.TransferCTable(b.dictLitEnc)
-		b.litEnc.Reuse = huff0.ReusePolicyAllow
-		b.dictLitEnc = nil
-	}
+	fromDict := b.useDictLits()
 	if len(b.literals) >= 1024 && !raw {
 		// Use 4 Streams.
 		out, reUsed, err = huff0.Compress4X(b.literals, b.litEnc)
 	} else if len(b.literals) > 16 && !raw {
 		// Use 1 stream
 		single = true
+		if fromDict {
+			// Like zstd, prefer the dictionary table for small inputs.
+			b.litEnc.Reuse = huff0.ReusePolicyPrefer
+		}
 		out, reUsed, err = huff0.Compress1X(b.literals, b.litEnc)
+		if fromDict {
+			b.litEnc.Reuse = huff0.ReusePolicyAllow
+		}
 	} else {
 		err = huff0.ErrIncompressible
 	}
