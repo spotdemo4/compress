@@ -115,12 +115,22 @@ func (s *sequenceDecs) useSafeDecodeSync() bool {
 	return false
 }
 
-// decode sequences from the stream with the provided history but without a dictionary.
+// decode sequences from the stream with the provided history.
+// A dictionary is decoded from as the history, when there is no other.
 func (s *sequenceDecs) decodeSyncSimple(hist []byte) (bool, error) {
-	if len(s.dict) > 0 {
-		return false, nil
-	}
 	maxBlockSize := min(s.windowSize, maxCompressedBlockSize)
+	windowSize := s.windowSize
+	if len(s.dict) > 0 {
+		// The dictionary precedes the output, as the history would, but
+		// matches into it are not limited by the window. When no match into
+		// the output can be outside the window, the window check only has
+		// to make room for the dictionary.
+		if len(hist) > 0 || len(s.out)+maxBlockSize > windowSize {
+			return false, nil
+		}
+		hist = s.dict
+		windowSize += len(s.dict)
+	}
 	if s.maxSyncLen == 0 && cap(s.out)-len(s.out) < maxBlockSize {
 		return false, nil
 	}
@@ -141,7 +151,7 @@ func (s *sequenceDecs) decodeSyncSimple(hist []byte) (bool, error) {
 		out:         s.out,
 		outPosition: len(s.out),
 		literals:    s.literals,
-		windowSize:  s.windowSize,
+		windowSize:  windowSize,
 		history:     hist,
 	}
 

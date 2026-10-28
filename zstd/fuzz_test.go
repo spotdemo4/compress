@@ -15,6 +15,9 @@ func FuzzDecodeAll(f *testing.F) {
 	fuzz.AddFromZip(f, "testdata/decode-regression.zip", fuzz.TypeRaw, false)
 	fuzz.AddFromZip(f, "testdata/fuzz/decode-corpus-raw.zip", fuzz.TypeRaw, testing.Short())
 	fuzz.AddFromZip(f, "testdata/fuzz/decode-corpus-encoded.zip", fuzz.TypeGoFuzz, testing.Short())
+	// Frames that start from these dictionaries.
+	fuzz.AddFromZip(f, "testdata/dict-tests-small.zip", fuzz.TypeRaw, false)
+	dicts := readDicts(f, testCreateZipReader("testdata/dict-tests-small.zip", f))
 
 	// compareNonAsm cross-checks the assembly decoder against a non-assembly
 	// path and requires byte-identical output. On amd64 this disables the BMI2
@@ -33,12 +36,12 @@ func FuzzDecodeAll(f *testing.F) {
 			}
 		}()
 
-		decLow, err := NewReader(nil, WithDecoderLowmem(true), WithDecoderConcurrency(2), WithDecoderMaxMemory(20<<20), WithDecoderMaxWindow(1<<20), IgnoreChecksum(true))
+		decLow, err := NewReader(nil, WithDecoderLowmem(true), WithDecoderConcurrency(2), WithDecoderMaxMemory(20<<20), WithDecoderMaxWindow(1<<20), IgnoreChecksum(true), WithDecoderDicts(dicts...))
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer decLow.Close()
-		decHi, err := NewReader(nil, WithDecoderLowmem(false), WithDecoderConcurrency(2), WithDecoderMaxMemory(20<<20), WithDecoderMaxWindow(1<<20), IgnoreChecksum(true))
+		decHi, err := NewReader(nil, WithDecoderLowmem(false), WithDecoderConcurrency(2), WithDecoderMaxMemory(20<<20), WithDecoderMaxWindow(1<<20), IgnoreChecksum(true), WithDecoderDicts(dicts...))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -57,12 +60,28 @@ func FuzzDecodeAll(f *testing.F) {
 			t.Fatalf("Output mismatch, low: %v, hi: %v", err1, err2)
 		}
 
+		if compareNonAsm {
+			// Decode again with the Go sequence decoder, which also handles
+			// the dictionaries itself, and require the same result.
+			decodeSyncGoOnly = true
+			restore := forceTwoPass(false)
+			bGo, errGo := decLow.DecodeAll(b, make([]byte, 0, len(b)))
+			decodeSyncGoOnly = false
+			restore()
+			if (err1 == nil) != (errGo == nil) {
+				t.Errorf("err asm: %v, Go: %v", err1, errGo)
+			}
+			if err1 == nil && !bytes.Equal(b1, bGo) {
+				t.Fatalf("asm vs Go output mismatch")
+			}
+		}
+
 		if compareNonAsm && cpuinfo.HasBMI2() {
 			// Decode again with the BMI2 assembly disabled and require identical
 			// output, exercising the assembly against the non-assembly path.
 			// Defer the restore so BMI2 is re-enabled on every exit path.
 			defer cpuinfo.DisableBMI2()()
-			decRef, errRef := NewReader(nil, WithDecoderLowmem(true), WithDecoderConcurrency(1), WithDecoderMaxMemory(20<<20), WithDecoderMaxWindow(1<<20), IgnoreChecksum(true))
+			decRef, errRef := NewReader(nil, WithDecoderLowmem(true), WithDecoderConcurrency(1), WithDecoderMaxMemory(20<<20), WithDecoderMaxWindow(1<<20), IgnoreChecksum(true), WithDecoderDicts(dicts...))
 			if errRef != nil {
 				t.Fatal(errRef)
 			}
