@@ -44,10 +44,17 @@
 > * [`zstd-prefer-repeat`](https://github.com/spotdemo4/compress/tree/zstd-prefer-repeat)
 >   (on `zstd-stream-dict-literals`): at `SpeedFastest` and `SpeedDefault`,
 >   small blocks keep the previous literal and sequence tables when they fit,
->   as libzstd's faster strategies do, instead of building new ones.
->   `EncodeAll` is 15-19% faster at `SpeedFastest` and streams 11-21% faster;
->   frames grow by at most 0.6%, but 64-byte flushed chunks of some data are
->   up to 8% larger.
+>   as libzstd's faster strategies do, instead of building new ones, and
+>   without such tables write fewer than 64 literals raw and use predefined
+>   tables for few sequences. `EncodeAll` is 15-19% faster at `SpeedFastest`
+>   and streams 11-21% faster, and flushed 256-byte messages without a
+>   dictionary in less than half the time; frames grow by at most 0.6%, but
+>   64-byte flushed chunks of some data are up to 8% larger.
+> * [`zstd-stream-repeat-offsets`](https://github.com/spotdemo4/compress/tree/zstd-stream-repeat-offsets)
+>   (on `zstd-dict-attach`): blocks of synchronous streams repeat offsets
+>   from the previous block after a match, instead of only from their fourth
+>   sequence. Flushed chunks are 1.2-1.7% smaller, up to 9.7% at 64 bytes,
+>   and frames 0.1-0.3% smaller.
 >
 > Use it with a `replace` directive:
 > `go mod edit -replace github.com/klauspost/compress=github.com/spotdemo4/compress@master`.
