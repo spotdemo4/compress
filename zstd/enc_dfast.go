@@ -38,7 +38,10 @@ type doubleFastEncoder struct {
 }
 
 type doubleFastEncoderDict struct {
-	fastEncoderDict
+	fastEncoder
+	dictTable           []tableEntry
+	tableShardDirty     [tableShardCnt]bool
+	allDirty            bool
 	longTable           [dFastLongTableSize]tableEntry
 	dictLongTable       []tableEntry
 	longTableShardDirty [dLongTableShardCnt]bool
@@ -1066,7 +1069,7 @@ func (e *doubleFastEncoder) ResetPrefix(prefix []byte) {
 func (e *doubleFastEncoderDict) Reset(d *dict, singleBlock bool) {
 	allDirty := e.allDirty
 	dictChanged := d != e.lastDict
-	e.fastEncoderDict.Reset(d, singleBlock)
+	e.resetShortTable(d, singleBlock)
 	if d == nil {
 		return
 	}
@@ -1127,8 +1130,85 @@ func (e *doubleFastEncoderDict) Reset(d *dict, singleBlock bool) {
 	}
 }
 
+// resetShortTable resets the encoder and copies the dictionary's short table.
+func (e *doubleFastEncoderDict) resetShortTable(d *dict, singleBlock bool) {
+	e.resetBase(d, singleBlock)
+	if d == nil {
+		return
+	}
+
+	// Init or copy dict table
+	if len(e.dictTable) != len(e.table) || d != e.lastDict {
+		if len(e.dictTable) != len(e.table) {
+			e.dictTable = make([]tableEntry, len(e.table))
+		} else {
+			clear(e.dictTable)
+		}
+		if true {
+			end := e.maxMatchOff + int32(len(d.content)) - 8
+			for i := e.maxMatchOff; i < end; i += 2 {
+				const hashLog = tableBits
+
+				cv := load6432(d.content, i-e.maxMatchOff)
+				nextHash := hashLen(cv, hashLog, tableFastHashLen)     // 0 -> 6
+				nextHash1 := hashLen(cv>>8, hashLog, tableFastHashLen) // 1 -> 7
+				e.dictTable[nextHash] = tableEntry{
+					val:    uint32(cv),
+					offset: i,
+				}
+				e.dictTable[nextHash1] = tableEntry{
+					val:    uint32(cv >> 8),
+					offset: i + 1,
+				}
+			}
+		}
+		e.lastDict = d
+		e.allDirty = true
+	}
+
+	e.cur = e.maxMatchOff
+	dirtyShardCnt := 0
+	if !e.allDirty {
+		for i := range e.tableShardDirty {
+			if e.tableShardDirty[i] {
+				dirtyShardCnt++
+			}
+		}
+	}
+
+	const shardCnt = tableShardCnt
+	const shardSize = tableShardSize
+	if e.allDirty || dirtyShardCnt > shardCnt*4/6 {
+		//copy(e.table[:], e.dictTable)
+		e.table = *(*[tableSize]tableEntry)(e.dictTable)
+		for i := range e.tableShardDirty {
+			e.tableShardDirty[i] = false
+		}
+		e.allDirty = false
+		return
+	}
+	for i := range e.tableShardDirty {
+		if !e.tableShardDirty[i] {
+			continue
+		}
+
+		//copy(e.table[i*shardSize:(i+1)*shardSize], e.dictTable[i*shardSize:(i+1)*shardSize])
+		*(*[shardSize]tableEntry)(e.table[i*shardSize:]) = *(*[shardSize]tableEntry)(e.dictTable[i*shardSize:])
+		e.tableShardDirty[i] = false
+	}
+	e.allDirty = false
+}
+
 func (e *doubleFastEncoderDict) ResetPrefix([]byte) {
 	panic("ResetPrefix not supported for dict encoders")
+}
+
+func (e *doubleFastEncoderDict) markAllShardsDirty() {
+	e.allDirty = true
+}
+
+func (e *doubleFastEncoderDict) markShardDirty(entryNum uint32) {
+	e.tableShardDirty[entryNum/tableShardSize] = true
 }
 
 func (e *doubleFastEncoderDict) markLongShardDirty(entryNum uint32) {

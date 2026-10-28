@@ -187,8 +187,10 @@ func (e *fastBase) resetBase(d *dict, singleBlock bool) {
 
 	// We offset current position so everything will be out of reach.
 	// If above reset line, history will be purged.
+	// The history may hold a dictionary larger than the margin above the
+	// reset line, so the offset stops at the line instead of overflowing.
 	if e.cur < e.bufferReset {
-		e.cur += e.maxMatchOff + int32(len(e.hist))
+		e.cur = int32(min(int64(e.cur)+int64(e.maxMatchOff)+int64(len(e.hist)), int64(e.bufferReset)))
 	}
 	if d == nil {
 		e.hist = e.hist[:0]
