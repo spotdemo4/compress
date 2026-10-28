@@ -140,6 +140,11 @@ func (e *Encoder) Reset(w io.Writer) {
 			s.writing.init()
 		}
 		s.writing.initNewEncode()
+		// The first block is encoded with the entropy state of s.writing.
+		if d := e.o.dict; d != nil {
+			s.writing.coders.seedPrevFromDict(d)
+			s.writing.dictLitEnc = d.litEnc
+		}
 	}
 	if s.encoder == nil {
 		s.encoder = e.o.encoder()

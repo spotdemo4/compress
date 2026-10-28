@@ -1177,8 +1177,8 @@ func TestEncoderDictSeedsSequenceTables(t *testing.T) {
 }
 
 // TestEncoderDictStreamFirstBlock checks that the first flushed block of a
-// stream starts from the dictionary's literal table, as EncodeAll does, and
-// that streams with and without concurrency decode.
+// stream starts from the dictionary's tables: its literals are encoded as by
+// EncodeAll, and the same with and without concurrency.
 func TestEncoderDictStreamFirstBlock(t *testing.T) {
 	zr := testCreateZipReader("testdata/dict-tests-small.zip", t)
 	dicts := readDicts(t, zr)
@@ -1249,6 +1249,9 @@ func TestEncoderDictStreamFirstBlock(t *testing.T) {
 						if err := enc.Close(); err != nil {
 							t.Fatal(err)
 						}
+					}
+					if !bytes.Equal(blocks[0], blocks[1]) {
+						t.Errorf("%d byte message: first block differs with concurrency", len(m))
 					}
 					want := firstBlock(encs[0].EncodeAll(m, nil))
 					if (want == nil) != (blocks[0] == nil) || want != nil && want[0]&3 != blocks[0][0]&3 {
