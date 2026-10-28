@@ -10,8 +10,9 @@
 >   smaller small frames with dictionaries. Fresh Huffman and FSE tables are
 >   no longer built when they can't beat the dictionary's tables, and huff0
 >   counts a new table's header when choosing whether to reuse one. Encoding
->   small messages with a dictionary is 35–50% faster at `SpeedFastest`, and
->   frames are 2–13% smaller at every level.
+>   small messages with a matching dictionary is 19–49% faster at
+>   `SpeedFastest` with Go 1.27 (see the PR for Go 1.26), and frames are
+>   1.5–17% smaller at every level.
 > * [`zstd-magicless-dictid`](https://github.com/spotdemo4/compress/tree/zstd-magicless-dictid)
 >   ([#1281](https://github.com/klauspost/compress/pull/1281)): magicless
 >   frames and frames without a dictionary ID. Adds `WithEncoderMagicless`,
