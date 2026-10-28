@@ -1447,7 +1447,7 @@ func TestEncoderDictFrames(t *testing.T) {
 			// Each frame moves the offsets by the window and history, so the
 			// offsets wrap after about 2 GiB / 128 KiB frames. Encoders that
 			// copy the dictionary tables reset them for every frame.
-			wrapped := level > SpeedFastest
+			wrapped := level > SpeedDefault
 			last, after := int32(0), 0
 			for i := 0; after < 100; i++ {
 				m := msg(64 + i%512)

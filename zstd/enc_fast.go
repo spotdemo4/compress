@@ -10,10 +10,8 @@ import (
 )
 
 const (
-	tableBits        = 15                               // Bits used in the table
-	tableSize        = 1 << tableBits                   // Size of the table
-	tableShardCnt    = 1 << (tableBits - dictShardBits) // Number of shards in the table
-	tableShardSize   = tableSize / tableShardCnt        // Size of an individual shard
+	tableBits        = 15             // Bits used in the table
+	tableSize        = 1 << tableBits // Size of the table
 	tableFastHashLen = 6
 	tableMask        = tableSize - 1 // Mask for table indices. Redundant, but can eliminate bounds checks.
 	maxMatchLength   = 131074
