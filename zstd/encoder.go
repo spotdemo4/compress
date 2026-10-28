@@ -386,7 +386,7 @@ func (e *Encoder) nextBlock(final bool) error {
 			s.eofWritten = true
 		}
 
-		s.err = blk.encode(src, e.o.noEntropy, !e.o.allLitEntropy)
+		s.err = blk.encode(src, e.o.noEntropy, !e.o.allLitEntropy, e.o.preferRepeat())
 		if s.err != nil {
 			return s.err
 		}
@@ -438,7 +438,7 @@ func (e *Encoder) nextBlock(final bool) error {
 				}
 				s.wWg.Done()
 			}()
-			s.writeErr = blk.encode(src, e.o.noEntropy, !e.o.allLitEntropy)
+			s.writeErr = blk.encode(src, e.o.noEntropy, !e.o.allLitEntropy, e.o.preferRepeat())
 			if s.writeErr != nil {
 				return
 			}
@@ -805,7 +805,7 @@ func (e *Encoder) encodeAll(enc encoder, src, dst []byte) []byte {
 		// Output directly to dst
 		blk.output = dst
 
-		err := blk.encode(src, e.o.noEntropy, !e.o.allLitEntropy)
+		err := blk.encode(src, e.o.noEntropy, !e.o.allLitEntropy, e.o.preferRepeat())
 		if err != nil {
 			panic(err)
 		}
@@ -828,7 +828,7 @@ func (e *Encoder) encodeAll(enc encoder, src, dst []byte) []byte {
 			if len(src) == 0 {
 				blk.last = true
 			}
-			err := blk.encode(todo, e.o.noEntropy, !e.o.allLitEntropy)
+			err := blk.encode(todo, e.o.noEntropy, !e.o.allLitEntropy, e.o.preferRepeat())
 			if err != nil {
 				panic(err)
 			}

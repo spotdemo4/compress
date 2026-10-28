@@ -72,6 +72,12 @@ func (o encoderOptions) encoder() encoder {
 	panic("unknown compression level")
 }
 
+// preferRepeat reports whether small blocks keep the previous entropy
+// tables when they can, as zstd's faster strategies do.
+func (o *encoderOptions) preferRepeat() bool {
+	return o.level <= SpeedDefault
+}
+
 // WithEncoderCRC will add CRC value to output.
 // Output will be 4 bytes larger.
 // Can be changed with ResetWithOptions.
