@@ -22,8 +22,9 @@ type dict struct {
 	content             []byte
 
 	// The match tables of content, built on first use by each level.
-	fastTable  fastDictTable
-	dFastTable dFastDictTable
+	fastTable    fastDictTable
+	dFastTable   dFastDictTable
+	betterTables betterDictTables
 }
 
 const dictMagic = "\x37\xa4\x30\xec"

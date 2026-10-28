@@ -7,10 +7,6 @@ import (
 	"github.com/klauspost/compress/zstd/internal/xxhash"
 )
 
-const (
-	dictShardBits = 7
-)
-
 type fastBase struct {
 	// cur is the offset at the start of hist
 	cur int32
