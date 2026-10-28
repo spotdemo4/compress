@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"math/bits"
+	"slices"
 )
 
 const (
@@ -671,8 +672,7 @@ func minNewSize(hist []uint32, total int) uint32 {
 	// one in remaining. A zero count is followed by 2 bits per 3 more zeros, plus 2.
 	hdr := uint32(4)
 	nnz, zeros := uint32(0), uint32(0)
-	for i := len(hist) - 1; i >= 0; i-- {
-		c := hist[i]
+	for i, c := range slices.Backward(hist) {
 		if c == 0 {
 			zeros++
 			continue
