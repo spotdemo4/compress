@@ -6,13 +6,12 @@ package zstd
 
 import (
 	"fmt"
+	"sync"
 )
 
 const (
-	tableBits        = 15                               // Bits used in the table
-	tableSize        = 1 << tableBits                   // Size of the table
-	tableShardCnt    = 1 << (tableBits - dictShardBits) // Number of shards in the table
-	tableShardSize   = tableSize / tableShardCnt        // Size of an individual shard
+	tableBits        = 15             // Bits used in the table
+	tableSize        = 1 << tableBits // Size of the table
 	tableFastHashLen = 6
 	tableMask        = tableSize - 1 // Mask for table indices. Redundant, but can eliminate bounds checks.
 	maxMatchLength   = 131074
@@ -28,11 +27,57 @@ type fastEncoder struct {
 	table [tableSize]tableEntry
 }
 
+// fastEncoderDict is a fastEncoder for frames that start from a dictionary.
 type fastEncoderDict struct {
 	fastEncoder
-	dictTable       []tableEntry
-	tableShardDirty [tableShardCnt]bool
-	allDirty        bool
+	// dictTable is lastDict's table, searched alongside e.table while the
+	// dictionary content starts hist. It is shared and must not be modified.
+	dictTable *[tableSize]tableEntry
+}
+
+// fastDictCopyMin is the size of the first block above which the dictionary
+// table is copied into e.table instead of being searched separately.
+const fastDictCopyMin = 32 << 10
+
+// fastDictTable is the SpeedFastest table of a dictionary's content,
+// built once and shared by every encoder that uses the dictionary.
+type fastDictTable struct {
+	once  sync.Once
+	base  int32
+	table *[tableSize]tableEntry
+}
+
+// get returns the table of content, whose offsets are content indexes plus
+// base. Encoders of a dictionary share a window size, so base rarely differs.
+func (t *fastDictTable) get(content []byte, base int32) *[tableSize]tableEntry {
+	t.once.Do(func() {
+		t.base, t.table = base, newFastDictTable(content, base)
+	})
+	if t.base != base {
+		return newFastDictTable(content, base)
+	}
+	return t.table
+}
+
+func newFastDictTable(content []byte, base int32) *[tableSize]tableEntry {
+	table := new([tableSize]tableEntry)
+	end := base + int32(len(content)) - 8
+	for i := base; i < end; i += 2 {
+		const hashLog = tableBits
+
+		cv := load6432(content, i-base)
+		nextHash := hashLen(cv, hashLog, tableFastHashLen)     // 0 -> 6
+		nextHash1 := hashLen(cv>>8, hashLog, tableFastHashLen) // 1 -> 7
+		table[nextHash] = tableEntry{
+			val:    uint32(cv),
+			offset: i,
+		}
+		table[nextHash1] = tableEntry{
+			val:    uint32(cv >> 8),
+			offset: i + 1,
+		}
+	}
+	return table
 }
 
 // Encode mimmics functionality in zstd_fast.c
@@ -536,9 +581,18 @@ func (e *fastEncoderDict) Encode(blk *blockEnc, src []byte) {
 		inputMargin            = 8
 		minNonLiteralBlockSize = 1 + 1 + inputMargin
 	)
-	if e.allDirty || len(src) > 32<<10 {
+	dictTable := e.dictTable
+	if dictTable != nil && len(e.hist) == len(e.lastDict.content) && len(src) > fastDictCopyMin {
+		// For a large first block, a copy of the dictionary table is
+		// cheaper than searching two tables.
+		e.table = *dictTable
+		e.cur = e.maxMatchOff
+		dictTable = nil
+	}
+	if dictTable == nil || len(e.hist)+len(src) > cap(e.hist) {
+		// Without the dictionary at the start of hist, only e.table is searched.
+		e.dictTable = nil
 		e.fastEncoder.Encode(blk, src)
-		e.allDirty = true
 		return
 	}
 	// Protect against e.cur wraparound.
@@ -625,9 +679,7 @@ encodeLoop:
 			repIndex := s - offset1 + 2
 
 			e.table[nextHash] = tableEntry{offset: s + e.cur, val: uint32(cv)}
-			e.markShardDirty(nextHash)
 			e.table[nextHash2] = tableEntry{offset: s + e.cur + 1, val: uint32(cv >> 8)}
-			e.markShardDirty(nextHash2)
 
 			if canRepeat && repIndex >= 0 && load3232(src, repIndex) == uint32(cv>>16) {
 				// Consider history as well.
@@ -698,6 +750,18 @@ encodeLoop:
 				}
 				break
 			}
+
+			// The dictionary table holds hist indexes plus maxMatchOff,
+			// so empty entries are out of reach.
+			dc := dictTable[nextHash]
+			if t = dc.offset - e.maxMatchOff; s-t < e.maxMatchOff && uint32(cv) == dc.val {
+				break
+			}
+			dc = dictTable[nextHash2]
+			if t = dc.offset - e.maxMatchOff; s+1-t < e.maxMatchOff && uint32(cv>>8) == dc.val {
+				s++
+				break
+			}
 			s += stepSize + ((s - nextEmit) >> (kSearchStrength - 1))
 			if s >= sLimit {
 				break encodeLoop
@@ -756,7 +820,6 @@ encodeLoop:
 			// Store this, since we have it.
 			nextHash := hashLen(cv, hashLog, tableFastHashLen)
 			e.table[nextHash] = tableEntry{offset: s + e.cur, val: uint32(cv)}
-			e.markShardDirty(nextHash)
 			seq.matchLen = uint32(l) - zstdMinMatch
 			seq.litLen = 0
 			// Since litlen is always 0, this is offset 1.
@@ -810,83 +873,26 @@ func (e *fastEncoder) ResetPrefix(prefix []byte) {
 	}
 }
 
-// ResetDict will reset and set a dictionary if not nil
+// Reset will reset and set a dictionary if not nil.
+// The dictionary is left at the start of hist and its table is shared,
+// so Reset does not depend on the dictionary size. The previous frame's
+// entries in e.table are out of reach after resetBase moves e.cur.
 func (e *fastEncoderDict) Reset(d *dict, singleBlock bool) {
 	e.resetBase(d, singleBlock)
+	e.dictTable = nil
 	if d == nil {
 		return
 	}
-
-	// Init or copy dict table
-	if len(e.dictTable) != len(e.table) || d != e.lastDict {
-		if len(e.dictTable) != len(e.table) {
-			e.dictTable = make([]tableEntry, len(e.table))
-		} else {
-			clear(e.dictTable)
-		}
-		if true {
-			end := e.maxMatchOff + int32(len(d.content)) - 8
-			for i := e.maxMatchOff; i < end; i += 2 {
-				const hashLog = tableBits
-
-				cv := load6432(d.content, i-e.maxMatchOff)
-				nextHash := hashLen(cv, hashLog, tableFastHashLen)     // 0 -> 6
-				nextHash1 := hashLen(cv>>8, hashLog, tableFastHashLen) // 1 -> 7
-				e.dictTable[nextHash] = tableEntry{
-					val:    uint32(cv),
-					offset: i,
-				}
-				e.dictTable[nextHash1] = tableEntry{
-					val:    uint32(cv >> 8),
-					offset: i + 1,
-				}
-			}
-		}
-		e.lastDict = d
-		e.allDirty = true
+	e.dictTable = d.fastTable.get(d.content, e.maxMatchOff)
+	e.lastDict = d
+	if e.cur >= e.bufferReset-int32(len(e.hist)) {
+		// Encode would keep entries near the end of hist, which may be
+		// from the previous frame.
+		e.table = [tableSize]tableEntry{}
+		e.cur = e.maxMatchOff
 	}
-
-	e.cur = e.maxMatchOff
-	dirtyShardCnt := 0
-	if !e.allDirty {
-		for i := range e.tableShardDirty {
-			if e.tableShardDirty[i] {
-				dirtyShardCnt++
-			}
-		}
-	}
-
-	const shardCnt = tableShardCnt
-	const shardSize = tableShardSize
-	if e.allDirty || dirtyShardCnt > shardCnt*4/6 {
-		//copy(e.table[:], e.dictTable)
-		e.table = *(*[tableSize]tableEntry)(e.dictTable)
-		for i := range e.tableShardDirty {
-			e.tableShardDirty[i] = false
-		}
-		e.allDirty = false
-		return
-	}
-	for i := range e.tableShardDirty {
-		if !e.tableShardDirty[i] {
-			continue
-		}
-
-		//copy(e.table[i*shardSize:(i+1)*shardSize], e.dictTable[i*shardSize:(i+1)*shardSize])
-		*(*[shardSize]tableEntry)(e.table[i*shardSize:]) = *(*[shardSize]tableEntry)(e.dictTable[i*shardSize:])
-		e.tableShardDirty[i] = false
-	}
-	e.allDirty = false
 }
 
 func (e *fastEncoderDict) ResetPrefix([]byte) {
 	panic("ResetPrefix not supported for dict encoders")
-}
-
-func (e *fastEncoderDict) markAllShardsDirty() {
-	e.allDirty = true
-}
-
-func (e *fastEncoderDict) markShardDirty(entryNum uint32) {
-	e.tableShardDirty[entryNum/tableShardSize] = true
 }

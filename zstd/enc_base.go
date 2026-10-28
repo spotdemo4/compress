@@ -7,10 +7,6 @@ import (
 	"github.com/klauspost/compress/zstd/internal/xxhash"
 )
 
-const (
-	dictShardBits = 7
-)
-
 type fastBase struct {
 	// cur is the offset at the start of hist
 	cur int32
@@ -22,7 +18,9 @@ type fastBase struct {
 	tmp         [8]byte
 	blk         *blockEnc
 	lastDict    *dict
-	lowMem      bool
+	// histDict is the dictionary whose content starts hist, if any.
+	histDict *dict
+	lowMem   bool
 }
 
 // CRC returns the underlying CRC writer.
@@ -69,6 +67,7 @@ func (e *fastBase) addBlock(src []byte) int32 {
 			// Move down
 			offset := int32(len(e.hist)) - e.maxMatchOff
 			copy(e.hist[0:e.maxMatchOff], e.hist[offset:])
+			e.histDict = nil
 			e.cur += offset
 			e.hist = e.hist[:e.maxMatchOff]
 		}
@@ -98,6 +97,7 @@ func (e *fastBase) ensureHist(n int) {
 		l = int32(n)
 	}
 	e.hist = make([]byte, 0, l)
+	e.histDict = nil
 }
 
 // useBlock will replace the block with the provided one,
@@ -154,6 +154,7 @@ func (e *fastBase) resetBasePrefix(prefix []byte) {
 	}
 	e.hist = e.hist[:0]
 	e.hist = append(e.hist, prefix...)
+	e.histDict = nil
 }
 
 // Reset the encoding table.
@@ -182,19 +183,29 @@ func (e *fastBase) resetBase(d *dict, singleBlock bool) {
 
 	// We offset current position so everything will be out of reach.
 	// If above reset line, history will be purged.
+	// The history may hold a dictionary larger than the margin above the
+	// reset line, so the offset stops at the line instead of overflowing.
 	if e.cur < e.bufferReset {
-		e.cur += e.maxMatchOff + int32(len(e.hist))
+		e.cur = int32(min(int64(e.cur)+int64(e.maxMatchOff)+int64(len(e.hist)), int64(e.bufferReset)))
 	}
-	e.hist = e.hist[:0]
-	if d != nil {
-		// Set offsets (currently not used)
-		for i, off := range d.offsets {
-			e.blk.recentOffsets[i] = uint32(off)
-			e.blk.prevRecentOffsets[i] = e.blk.recentOffsets[i]
-		}
-		// Transfer litenc.
-		e.blk.dictLitEnc = d.litEnc
-		e.blk.coders.seedPrevFromDict(d)
-		e.hist = append(e.hist, d.content...)
+	if d == nil {
+		e.hist = e.hist[:0]
+		e.histDict = nil
+		return
 	}
+	// Set offsets (currently not used)
+	for i, off := range d.offsets {
+		e.blk.recentOffsets[i] = uint32(off)
+		e.blk.prevRecentOffsets[i] = e.blk.recentOffsets[i]
+	}
+	// Transfer litenc.
+	e.blk.dictLitEnc = d.litEnc
+	e.blk.coders.seedPrevFromDict(d)
+	if e.histDict == d {
+		// Frames only append to hist, so the content is still at its start.
+		e.hist = e.hist[:len(d.content)]
+		return
+	}
+	e.hist = append(e.hist[:0], d.content...)
+	e.histDict = d
 }

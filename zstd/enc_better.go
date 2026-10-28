@@ -4,7 +4,10 @@
 
 package zstd
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 const (
 	betterLongTableBits = 19                       // Bits used in the long match table
@@ -19,11 +22,6 @@ const (
 	betterShortTableSize = 1 << betterShortTableBits // Size of the table
 	betterShortLen       = 5                         // Bytes used for table hash
 
-	betterLongTableShardCnt  = 1 << (betterLongTableBits - dictShardBits)    // Number of shards in the table
-	betterLongTableShardSize = betterLongTableSize / betterLongTableShardCnt // Size of an individual shard
-
-	betterShortTableShardCnt  = 1 << (betterShortTableBits - dictShardBits)     // Number of shards in the table
-	betterShortTableShardSize = betterShortTableSize / betterShortTableShardCnt // Size of an individual shard
 )
 
 // betterHashL is hashLen(u, betterLongTableBits, betterLongLen) with prime = prime8bytes.
@@ -53,13 +51,86 @@ type betterFastEncoder struct {
 	longTable [betterLongTableSize]prevEntry
 }
 
+// betterFastEncoderDict is a betterFastEncoder for frames that start from a dictionary.
 type betterFastEncoderDict struct {
 	betterFastEncoder
-	dictTable            []tableEntry
-	dictLongTable        []prevEntry
-	shortTableShardDirty [betterShortTableShardCnt]bool
-	longTableShardDirty  [betterLongTableShardCnt]bool
-	allDirty             bool
+	// dictTable and dictLongTable are lastDict's tables, searched alongside
+	// e's while the dictionary content starts hist. They are shared and must
+	// not be modified.
+	dictTable     *[betterShortTableSize]tableEntry
+	dictLongTable *[betterLongTableSize]prevEntry
+}
+
+// betterDictTables are the SpeedBetterCompression tables of a dictionary's
+// content, built once and shared by every encoder that uses the dictionary.
+type betterDictTables struct {
+	once  sync.Once
+	base  int32
+	short *[betterShortTableSize]tableEntry
+	long  *[betterLongTableSize]prevEntry
+}
+
+// get returns the tables of content, whose offsets are content indexes plus
+// base. Encoders of a dictionary share a window size, so base rarely differs.
+func (t *betterDictTables) get(content []byte, base int32) (*[betterShortTableSize]tableEntry, *[betterLongTableSize]prevEntry) {
+	t.once.Do(func() {
+		t.base = base
+		t.short, t.long = newBetterDictTables(content, base)
+	})
+	if t.base != base {
+		return newBetterDictTables(content, base)
+	}
+	return t.short, t.long
+}
+
+func newBetterDictTables(content []byte, base int32) (*[betterShortTableSize]tableEntry, *[betterLongTableSize]prevEntry) {
+	short, long := new([betterShortTableSize]tableEntry), new([betterLongTableSize]prevEntry)
+	end := int32(len(content)) - 8 + base
+	for i := base; i < end; i += 4 {
+		const hashLog = betterShortTableBits
+
+		cv := load6432(content, i-base)
+		nextHash := hashLen(cv, hashLog, betterShortLen)      // 0 -> 4
+		nextHash1 := hashLen(cv>>8, hashLog, betterShortLen)  // 1 -> 5
+		nextHash2 := hashLen(cv>>16, hashLog, betterShortLen) // 2 -> 6
+		nextHash3 := hashLen(cv>>24, hashLog, betterShortLen) // 3 -> 7
+		short[nextHash] = tableEntry{
+			val:    uint32(cv),
+			offset: i,
+		}
+		short[nextHash1] = tableEntry{
+			val:    uint32(cv >> 8),
+			offset: i + 1,
+		}
+		short[nextHash2] = tableEntry{
+			val:    uint32(cv >> 16),
+			offset: i + 2,
+		}
+		short[nextHash3] = tableEntry{
+			val:    uint32(cv >> 24),
+			offset: i + 3,
+		}
+	}
+	if len(content) >= 8 {
+		cv := load6432(content, 0)
+		h := hashLen(cv, betterLongTableBits, betterLongLen)
+		long[h] = prevEntry{
+			offset: base,
+			prev:   long[h].offset,
+		}
+
+		off := 8 // First to read
+		for i := base + 1; i < end; i++ {
+			cv = cv>>8 | (uint64(content[off]) << 56)
+			h := hashLen(cv, betterLongTableBits, betterLongLen)
+			long[h] = prevEntry{
+				offset: i,
+				prev:   long[h].offset,
+			}
+			off++
+		}
+	}
+	return short, long
 }
 
 // Encode improves compression...
@@ -591,6 +662,13 @@ func (e *betterFastEncoderDict) Encode(blk *blockEnc, src []byte) {
 		inputMargin            = 8 + 2
 		minNonLiteralBlockSize = 16
 	)
+	dictTable, dictLongTable := e.dictTable, e.dictLongTable
+	if dictTable == nil || len(e.hist)+len(src) > cap(e.hist) {
+		// Without the dictionary at the start of hist, only e's tables are searched.
+		e.dictTable, e.dictLongTable = nil, nil
+		e.betterFastEncoder.Encode(blk, src)
+		return
+	}
 
 	// Protect against e.cur wraparound.
 	for e.cur >= e.bufferReset-int32(len(e.hist)) {
@@ -602,7 +680,6 @@ func (e *betterFastEncoderDict) Encode(blk *blockEnc, src []byte) {
 				e.longTable[i] = prevEntry{}
 			}
 			e.cur = e.maxMatchOff
-			e.allDirty = true
 			break
 		}
 		// Shift down everything in the table that isn't already too far away.
@@ -635,7 +712,6 @@ func (e *betterFastEncoderDict) Encode(blk *blockEnc, src []byte) {
 				prev:   v2,
 			}
 		}
-		e.allDirty = true
 		e.cur = e.maxMatchOff
 		break
 	}
@@ -699,9 +775,7 @@ encodeLoop:
 			repIndex := s - offset1 + repOff
 			off := s + e.cur
 			e.longTable[nextHashL] = prevEntry{offset: off, prev: candidateL.offset}
-			e.markLongShardDirty(nextHashL)
 			e.table[nextHashS] = tableEntry{offset: off, val: uint32(cv)}
-			e.markShortShardDirty(nextHashS)
 			index0 = s + 1
 
 			if canRepeat {
@@ -753,9 +827,7 @@ encodeLoop:
 						off := index0 + e.cur
 						h1 := betterHashS(cv1, primeS)
 						e.table[h1] = tableEntry{offset: off + 1, val: uint32(cv1)}
-						e.markShortShardDirty(h1)
 						e.longTable[h0] = prevEntry{offset: off, prev: e.longTable[h0].offset}
-						e.markLongShardDirty(h0)
 					}
 					cv = load6432(src, s)
 					continue
@@ -812,9 +884,7 @@ encodeLoop:
 						off := index0 + e.cur
 						h1 := betterHashS(cv1, primeS)
 						e.table[h1] = tableEntry{offset: off + 1, val: uint32(cv1)}
-						e.markShortShardDirty(h1)
 						e.longTable[h0] = prevEntry{offset: off, prev: e.longTable[h0].offset}
-						e.markLongShardDirty(h0)
 					}
 					cv = load6432(src, s)
 					// Swap offsets
@@ -858,11 +928,8 @@ encodeLoop:
 						println("long match")
 					}
 				}
-				break
-			}
-
-			// Check if we have a long match on prev.
-			if s-coffsetLP < e.maxMatchOff && cv == load6432(src, coffsetLP) {
+			} else if s-coffsetLP < e.maxMatchOff && cv == load6432(src, coffsetLP) {
+				// Check if we have a long match on prev.
 				// Found a long match, at least 8 bytes.
 				matched = e.matchlen(s+8, coffsetLP+8, src) + 8
 				t = coffsetLP
@@ -875,13 +942,36 @@ encodeLoop:
 				if debugMatches {
 					println("long match")
 				}
+			}
+
+			// Keep the longest of these and the dictionary's long matches.
+			// The dictionary tables hold hist indexes plus maxMatchOff,
+			// so empty entries are out of reach.
+			dl := dictLongTable[nextHashL]
+			for _, off := range [2]int32{dl.offset, dl.prev} {
+				coffsetL = off - e.maxMatchOff
+				if s-coffsetL < e.maxMatchOff && cv == load6432(src, coffsetL) {
+					// Found a long match, at least 8 bytes.
+					if l := e.matchlen(s+8, coffsetL+8, src) + 8; l > matched {
+						matched, t = l, coffsetL
+					}
+				}
+			}
+			if matched > 0 {
 				break
 			}
 
 			coffsetS := candidateS.offset - e.cur
+			if s-coffsetS >= e.maxMatchOff || uint32(cv) != candidateS.val {
+				ds := dictTable[nextHashS]
+				coffsetS = ds.offset - e.maxMatchOff
+				if s-coffsetS >= e.maxMatchOff || uint32(cv) != ds.val {
+					coffsetS = -1
+				}
+			}
 
 			// Check if we have a short match.
-			if s-coffsetS < e.maxMatchOff && uint32(cv) == candidateS.val {
+			if coffsetS >= 0 {
 				// found a regular match
 				matched = e.matchlen(s+4, coffsetS+4, src) + 4
 
@@ -894,35 +984,29 @@ encodeLoop:
 
 				// We can store it, since we have at least a 4 byte match.
 				e.longTable[nextHashL] = prevEntry{offset: s + checkAt + e.cur, prev: candidateL.offset}
-				e.markLongShardDirty(nextHashL)
-				if s-coffsetL < e.maxMatchOff && cv == load6432(src, coffsetL) {
-					// Found a long match, at least 8 bytes.
-					matchedNext := e.matchlen(s+8+checkAt, coffsetL+8, src) + 8
-					if matchedNext > matched {
-						t = coffsetL
-						s += checkAt
-						matched = matchedNext
-						if debugMatches {
-							println("long match (after short)")
+
+				// Take the longest long match there, if it is longer.
+				dl := dictLongTable[nextHashL]
+				tL := int32(-1)
+				for i, off := range [4]int32{candidateL.offset, candidateL.prev, dl.offset, dl.prev} {
+					coffsetL = off - e.cur
+					if i >= 2 {
+						coffsetL = off - e.maxMatchOff
+					}
+					if s-coffsetL < e.maxMatchOff && cv == load6432(src, coffsetL) {
+						// Found a long match, at least 8 bytes.
+						if l := e.matchlen(s+8+checkAt, coffsetL+8, src) + 8; l > matched {
+							matched, tL = l, coffsetL
 						}
-						break
 					}
 				}
-
-				// Check prev long...
-				coffsetL = candidateL.prev - e.cur
-				if s-coffsetL < e.maxMatchOff && cv == load6432(src, coffsetL) {
-					// Found a long match, at least 8 bytes.
-					matchedNext := e.matchlen(s+8+checkAt, coffsetL+8, src) + 8
-					if matchedNext > matched {
-						t = coffsetL
-						s += checkAt
-						matched = matchedNext
-						if debugMatches {
-							println("prev long match (after short)")
-						}
-						break
+				if tL >= 0 {
+					t = tL
+					s += checkAt
+					if debugMatches {
+						println("long match (after short)")
 					}
+					break
 				}
 				t = coffsetS
 				if debugAsserts && s <= t {
@@ -980,6 +1064,17 @@ encodeLoop:
 					}
 				}
 			}
+
+			// And the dictionary's.
+			dl := dictLongTable[nextHashL]
+			for _, off := range [2]int32{dl.offset, dl.prev} {
+				coffsetL = off - e.maxMatchOff - matched
+				if coffsetL >= 0 && coffsetL < s && s-coffsetL < e.maxMatchOff && cv == load3232(src, coffsetL) {
+					if l := e.matchlen(s+4, coffsetL+4, src) + 4; l > matched {
+						t, matched = coffsetL, l
+					}
+				}
+			}
 		}
 		// A match has been found. Update recent offsets.
 		offset2 = offset1
@@ -1029,10 +1124,8 @@ encodeLoop:
 			cv1 := cv0 >> 8
 			h1 := betterHashS(cv1, primeS)
 			e.table[h1] = tableEntry{offset: off + 1, val: uint32(cv1)}
-			e.markShortShardDirty(h1)
 			h0 := betterHashL(cv0, primeL)
 			e.longTable[h0] = prevEntry{offset: off, prev: e.longTable[h0].offset}
-			e.markLongShardDirty(h0)
 			off += 2
 		}
 
@@ -1058,9 +1151,7 @@ encodeLoop:
 			l := 4 + e.matchlen(s+4, o2+4, src)
 
 			e.longTable[nextHashL] = prevEntry{offset: s + e.cur, prev: e.longTable[nextHashL].offset}
-			e.markLongShardDirty(nextHashL)
 			e.table[nextHashS] = tableEntry{offset: s + e.cur, val: uint32(cv)}
-			e.markShortShardDirty(nextHashS)
 			seq.matchLen = uint32(l) - zstdMinMatch
 			seq.litLen = 0
 
@@ -1116,147 +1207,27 @@ func (e *betterFastEncoder) ResetPrefix(prefix []byte) {
 	}
 }
 
-// ResetDict will reset and set a dictionary if not nil
+// Reset will reset and set a dictionary if not nil.
+// The dictionary is left at the start of hist and its tables are shared,
+// so Reset does not depend on the dictionary size. The previous frame's
+// entries in e's tables are out of reach after resetBase moves e.cur.
 func (e *betterFastEncoderDict) Reset(d *dict, singleBlock bool) {
 	e.resetBase(d, singleBlock)
+	e.dictTable, e.dictLongTable = nil, nil
 	if d == nil {
 		return
 	}
-	dictChanged := d != e.lastDict
-	// Init or copy dict table
-	if len(e.dictTable) != len(e.table) || dictChanged {
-		if len(e.dictTable) != len(e.table) {
-			e.dictTable = make([]tableEntry, len(e.table))
-		} else {
-			clear(e.dictTable)
-		}
-		end := int32(len(d.content)) - 8 + e.maxMatchOff
-		for i := e.maxMatchOff; i < end; i += 4 {
-			const hashLog = betterShortTableBits
-
-			cv := load6432(d.content, i-e.maxMatchOff)
-			nextHash := hashLen(cv, hashLog, betterShortLen)      // 0 -> 4
-			nextHash1 := hashLen(cv>>8, hashLog, betterShortLen)  // 1 -> 5
-			nextHash2 := hashLen(cv>>16, hashLog, betterShortLen) // 2 -> 6
-			nextHash3 := hashLen(cv>>24, hashLog, betterShortLen) // 3 -> 7
-			e.dictTable[nextHash] = tableEntry{
-				val:    uint32(cv),
-				offset: i,
-			}
-			e.dictTable[nextHash1] = tableEntry{
-				val:    uint32(cv >> 8),
-				offset: i + 1,
-			}
-			e.dictTable[nextHash2] = tableEntry{
-				val:    uint32(cv >> 16),
-				offset: i + 2,
-			}
-			e.dictTable[nextHash3] = tableEntry{
-				val:    uint32(cv >> 24),
-				offset: i + 3,
-			}
-		}
-		e.allDirty = true
-	}
-
-	// Init or copy dict long table
-	if len(e.dictLongTable) != len(e.longTable) || dictChanged {
-		if len(e.dictLongTable) != len(e.longTable) {
-			e.dictLongTable = make([]prevEntry, len(e.longTable))
-		} else {
-			clear(e.dictLongTable)
-		}
-		if len(d.content) >= 8 {
-			cv := load6432(d.content, 0)
-			h := hashLen(cv, betterLongTableBits, betterLongLen)
-			e.dictLongTable[h] = prevEntry{
-				offset: e.maxMatchOff,
-				prev:   e.dictLongTable[h].offset,
-			}
-
-			end := int32(len(d.content)) - 8 + e.maxMatchOff
-			off := 8 // First to read
-			for i := e.maxMatchOff + 1; i < end; i++ {
-				cv = cv>>8 | (uint64(d.content[off]) << 56)
-				h := hashLen(cv, betterLongTableBits, betterLongLen)
-				e.dictLongTable[h] = prevEntry{
-					offset: i,
-					prev:   e.dictLongTable[h].offset,
-				}
-				off++
-			}
-		}
-		e.allDirty = true
-	}
+	e.dictTable, e.dictLongTable = d.betterTables.get(d.content, e.maxMatchOff)
 	e.lastDict = d
-
-	// Reset table to initial state
-	{
-		dirtyShardCnt := 0
-		if !e.allDirty {
-			for i := range e.shortTableShardDirty {
-				if e.shortTableShardDirty[i] {
-					dirtyShardCnt++
-				}
-			}
-		}
-		const shardCnt = betterShortTableShardCnt
-		const shardSize = betterShortTableShardSize
-		if e.allDirty || dirtyShardCnt > shardCnt*4/6 {
-			copy(e.table[:], e.dictTable)
-			for i := range e.shortTableShardDirty {
-				e.shortTableShardDirty[i] = false
-			}
-		} else {
-			for i := range e.shortTableShardDirty {
-				if !e.shortTableShardDirty[i] {
-					continue
-				}
-
-				copy(e.table[i*shardSize:(i+1)*shardSize], e.dictTable[i*shardSize:(i+1)*shardSize])
-				e.shortTableShardDirty[i] = false
-			}
-		}
+	if e.cur >= e.bufferReset-int32(len(e.hist)) {
+		// Encode would keep entries near the end of hist, which may be
+		// from the previous frame.
+		e.table = [betterShortTableSize]tableEntry{}
+		e.longTable = [betterLongTableSize]prevEntry{}
+		e.cur = e.maxMatchOff
 	}
-	{
-		dirtyShardCnt := 0
-		if !e.allDirty {
-			for i := range e.shortTableShardDirty {
-				if e.shortTableShardDirty[i] {
-					dirtyShardCnt++
-				}
-			}
-		}
-		const shardCnt = betterLongTableShardCnt
-		const shardSize = betterLongTableShardSize
-		if e.allDirty || dirtyShardCnt > shardCnt*4/6 {
-			copy(e.longTable[:], e.dictLongTable)
-			for i := range e.longTableShardDirty {
-				e.longTableShardDirty[i] = false
-			}
-		} else {
-			for i := range e.longTableShardDirty {
-				if !e.longTableShardDirty[i] {
-					continue
-				}
-
-				copy(e.longTable[i*shardSize:(i+1)*shardSize], e.dictLongTable[i*shardSize:(i+1)*shardSize])
-				e.longTableShardDirty[i] = false
-			}
-		}
-	}
-	e.cur = e.maxMatchOff
-	e.allDirty = false
 }
 
 func (e *betterFastEncoderDict) ResetPrefix([]byte) {
 	panic("ResetPrefix not supported for dict encoders")
-}
-
-func (e *betterFastEncoderDict) markLongShardDirty(entryNum uint32) {
-	e.longTableShardDirty[entryNum/betterLongTableShardSize] = true
-}
-
-func (e *betterFastEncoderDict) markShortShardDirty(entryNum uint32) {
-	e.shortTableShardDirty[entryNum/betterShortTableShardSize] = true
 }

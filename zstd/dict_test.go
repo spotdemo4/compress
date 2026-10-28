@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1247,6 +1248,264 @@ func TestEncoderChooseCompWithDictTables(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("got mode %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// BenchmarkDictRecords compresses small messages with a dictionary: one frame
+// each with EncodeAll and DecodeAll, and a stream that is flushed after every
+// message and read one flush at a time.
+//
+// It reads testdata/benchmark-dict/NAME.zst, holding newline-separated
+// records, and NAME.dict, a dictionary such as `zstd --train` makes from
+// other records of the same kind. Each message is consecutive records cut to
+// the benchmark's size.
+func BenchmarkDictRecords(b *testing.B) {
+	files, _ := filepath.Glob("testdata/benchmark-dict/*.zst")
+	if len(files) == 0 {
+		b.Skip("no records in testdata/benchmark-dict")
+	}
+	levels := []EncoderLevel{SpeedFastest, SpeedDefault, SpeedBetterCompression}
+	for _, fn := range files {
+		name := strings.TrimSuffix(filepath.Base(fn), ".zst")
+		dict, err := os.ReadFile(strings.TrimSuffix(fn, ".zst") + ".dict")
+		if err != nil {
+			b.Fatal(err)
+		}
+		compressed, err := os.ReadFile(fn)
+		if err != nil {
+			b.Fatal(err)
+		}
+		dec, err := NewReader(nil, WithDecoderConcurrency(0), WithDecoderDicts(dict))
+		if err != nil {
+			b.Fatal(err)
+		}
+		data, err := dec.DecodeAll(compressed, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		records := bytes.Split(bytes.TrimSuffix(data, []byte("\n")), []byte("\n"))
+		for _, size := range []int{64, 256, 1024, 4096} {
+			var msgs [][]byte
+			for i := 0; i < len(records) && len(msgs) < 1000; {
+				var m []byte
+				for ; i < len(records) && len(m) < size; i++ {
+					m = append(append(m, records[i]...), '\n')
+				}
+				if len(m) >= size {
+					msgs = append(msgs, m[:size])
+				}
+			}
+			if len(msgs) == 0 {
+				continue
+			}
+			for _, level := range levels {
+				enc, err := NewWriter(nil, WithEncoderLevel(level), WithEncoderCRC(false),
+					WithSingleSegment(true), WithEncoderDict(dict))
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.Run(fmt.Sprintf("%s/EncodeAll/%s/%d", name, level, size), func(b *testing.B) {
+					dst := make([]byte, 0, 2*size)
+					var out int
+					b.SetBytes(int64(size))
+					b.ReportAllocs()
+					for i := 0; b.Loop(); i++ {
+						dst = enc.EncodeAll(msgs[i%len(msgs)], dst[:0])
+						out += len(dst)
+					}
+					b.ReportMetric(float64(out)/float64(b.N), "B/frame")
+				})
+				if level == SpeedFastest {
+					frames := make([][]byte, len(msgs))
+					for i, m := range msgs {
+						frames[i] = enc.EncodeAll(m, nil)
+					}
+					b.Run(fmt.Sprintf("%s/DecodeAll/%d", name, size), func(b *testing.B) {
+						dst := make([]byte, 0, size)
+						b.SetBytes(int64(size))
+						b.ReportAllocs()
+						for i := 0; b.Loop(); i++ {
+							if dst, err = dec.DecodeAll(frames[i%len(frames)], dst[:0]); err != nil {
+								b.Fatal(err)
+							}
+						}
+					})
+				}
+				b.Run(fmt.Sprintf("%s/Stream/%s/%d", name, level, size), func(b *testing.B) {
+					benchmarkDictStream(b, dict, level, msgs)
+				})
+			}
+		}
+	}
+}
+
+// benchmarkDictStream writes msgs to a stream with a 64 KiB window, flushing
+// after each and ending the frame every 60 KiB, and reads back each flush.
+func benchmarkDictStream(b *testing.B, dict []byte, level EncoderLevel, msgs [][]byte) {
+	var flushed bytes.Buffer
+	enc, err := NewWriter(&flushed, WithEncoderLevel(level), WithEncoderCRC(false),
+		WithWindowSize(1<<16), WithEncoderConcurrency(1), WithEncoderDict(dict))
+	if err != nil {
+		b.Fatal(err)
+	}
+	dec, err := NewReader(nil, WithDecoderConcurrency(1), WithDecoderMaxWindow(1<<16), WithDecoderDicts(dict))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer dec.Close()
+	var in bytes.Reader
+	got := make([]byte, len(msgs[0])+1)
+	var out, inFrame int
+	b.SetBytes(int64(len(msgs[0])))
+	b.ReportAllocs()
+	for i := 0; b.Loop(); i++ {
+		m := msgs[i%len(msgs)]
+		flushed.Reset()
+		first := inFrame == 0
+		if first {
+			enc.Reset(&flushed)
+		}
+		if _, err := enc.Write(m); err != nil {
+			b.Fatal(err)
+		}
+		inFrame += len(m)
+		last := inFrame >= 60<<10
+		if last {
+			err = enc.Close()
+			inFrame = 0
+		} else {
+			err = enc.Flush()
+		}
+		if err != nil {
+			b.Fatal(err)
+		}
+		out += flushed.Len()
+		in.Reset(flushed.Bytes())
+		if first {
+			if err := dec.Reset(&in); err != nil {
+				b.Fatal(err)
+			}
+		}
+		n, err := io.ReadFull(dec, got[:len(m)])
+		if err != nil || !bytes.Equal(got[:n], m) {
+			b.Fatal("message", i, "mismatch:", err)
+		}
+		if last {
+			if n, err := dec.Read(got); n != 0 || err != io.EOF {
+				b.Fatal("frame did not end:", n, err)
+			}
+		}
+	}
+	b.ReportMetric(float64(out)/float64(b.N), "B/chunk")
+}
+
+// TestEncoderDictFrames encodes many frames that start from a dictionary:
+// enough one-shot frames to wrap the encoders' offsets, and streams long
+// enough to move the history down, with a large first block, followed by a
+// frame that starts from the dictionary again.
+func TestEncoderDictFrames(t *testing.T) {
+	content := make([]byte, 128<<10)
+	rng := rand.New(rand.NewSource(1))
+	for i := range content {
+		content[i] = "abcdefgh"[rng.Intn(8)]
+	}
+	// msg is n bytes of dictionary content with some changes.
+	msg := func(n int) []byte {
+		start := rng.Intn(len(content) - n)
+		m := bytes.Clone(content[start : start+n])
+		for range n / 16 {
+			m[rng.Intn(n)] = byte(rng.Intn(256))
+		}
+		return m
+	}
+	const id = 1234
+	dec, err := NewReader(nil, WithDecoderConcurrency(1), WithDecoderDictRaw(id, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	cur := func(e encoder) int32 {
+		switch e := e.(type) {
+		case *fastEncoderDict:
+			return e.cur
+		case *doubleFastEncoderDict:
+			return e.cur
+		case *betterFastEncoderDict:
+			return e.cur
+		case *bestFastEncoder:
+			return e.cur
+		}
+		t.Fatalf("unexpected encoder %T", e)
+		return 0
+	}
+	for level := SpeedFastest; level < speedLast; level++ {
+		t.Run(level.String()+"/EncodeAll", func(t *testing.T) {
+			enc, err := NewWriter(nil, WithEncoderLevel(level), WithEncoderConcurrency(1),
+				WithWindowSize(MinWindowSize), WithEncoderDictRaw(id, content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Each frame moves the offsets by the window and history, so the
+			// offsets wrap after about 2 GiB / 128 KiB frames. Encoders that
+			// copy the dictionary tables reset them for every frame.
+			wrapped := level > SpeedBetterCompression
+			last, after := int32(0), 0
+			for i := 0; after < 100; i++ {
+				m := msg(64 + i%512)
+				frame := enc.EncodeAll(m, nil)
+				e := <-enc.encoders
+				enc.encoders <- e
+				if c := cur(e); c < last {
+					wrapped = true
+				} else {
+					last = c
+				}
+				if wrapped {
+					after++
+				}
+				got, err := dec.DecodeAll(frame, nil)
+				if err != nil || !bytes.Equal(got, m) {
+					t.Fatalf("frame %d: %v", i, err)
+				}
+				if i > 100000 {
+					t.Fatal("offsets did not wrap")
+				}
+			}
+		})
+		t.Run(level.String()+"/Stream", func(t *testing.T) {
+			var out bytes.Buffer
+			enc, err := NewWriter(&out, WithEncoderLevel(level), WithEncoderConcurrency(1),
+				WithWindowSize(1<<16), WithEncoderDictRaw(id, content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, size := range []int{3 << 20, 1000} {
+				out.Reset()
+				enc.Reset(&out)
+				var want []byte
+				for n := 0; len(want) < size; n++ {
+					// A large first block, then flushed small ones.
+					m := msg(100 + 900*(n%2))
+					if n == 0 && size > 1000 {
+						m = msg(40 << 10)
+					}
+					want = append(want, m...)
+					if _, err := enc.Write(m); err != nil {
+						t.Fatal(err)
+					}
+					if err := enc.Flush(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := enc.Close(); err != nil {
+					t.Fatal(err)
+				}
+				got, err := dec.DecodeAll(out.Bytes(), nil)
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("%d byte stream: %v", size, err)
+				}
 			}
 		})
 	}
