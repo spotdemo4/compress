@@ -445,17 +445,28 @@ func (b *blockEnc) dropUnwrittenTable(reUsed bool) {
 // Otherwise the tables are compared as usual, and the previous table is
 // kept for later blocks.
 func (b *blockEnc) compressLits1X(lits []byte, preferRepeat bool) ([]byte, bool, error) {
-	if !preferRepeat || b.litEnc.Reuse != huff0.ReusePolicyAllow {
+	if !preferRepeat {
 		return huff0.Compress1X(lits, b.litEnc)
 	}
-	b.litEnc.Reuse = huff0.ReusePolicyMust
-	out, reUsed, err := huff0.Compress1X(lits, b.litEnc)
-	b.litEnc.Reuse = huff0.ReusePolicyAllow
-	if err == huff0.ErrIncompressible {
-		return huff0.Compress1X(lits, b.litEnc)
+	if b.litEnc.Reuse == huff0.ReusePolicyAllow {
+		b.litEnc.Reuse = huff0.ReusePolicyMust
+		out, reUsed, err := huff0.Compress1X(lits, b.litEnc)
+		b.litEnc.Reuse = huff0.ReusePolicyAllow
+		if err != huff0.ErrIncompressible {
+			return out, reUsed, err
+		}
 	}
-	return out, reUsed, err
+	if len(lits) < preferRawLits {
+		// A new table saves little on so few literals.
+		return nil, false, huff0.ErrIncompressible
+	}
+	return huff0.Compress1X(lits, b.litEnc)
 }
+
+// preferRawLits is the number of literals below which, with preferRepeat,
+// literals that cannot use the previous table are not compressed, as in
+// zstd's ZSTD_minLiteralsToCompress for its faster strategies.
+const preferRawLits = 64
 
 // encodeRLE will encode an RLE block.
 func (b *blockEnc) encodeRLE(val byte, length uint32) {
@@ -797,6 +808,8 @@ func (b *blockEnc) encode(org []byte, raw, rawAllLits, preferRepeat bool) error 
 // With preferRepeat, a previous table that can be used is kept for fewer
 // than 1000 sequences, like zstd's faster strategies, so later blocks can
 // still use it. Only the last block may pick the predefined table instead.
+// Without a previous table, fewer sequences than the predefined table has
+// states use it.
 func (b *blockEnc) chooseComp(cur, prev, preDef *fseEncoder, rle uint8, preferRepeat bool) (*fseEncoder, seqCompMode, error) {
 	nSeq := len(b.sequences)
 	if cur.maxCount == nSeq {
@@ -821,6 +834,14 @@ func (b *blockEnc) chooseComp(cur, prev, preDef *fseEncoder, rle uint8, preferRe
 			}
 			return prev, compModeRepeat, nil
 		}
+	}
+	// Like zstd's faster strategies, use the predefined table for fewer
+	// sequences than it has states, without bounding a new one.
+	if preferRepeat && !forcePreDef && predefSize != math.MaxUint32 && nSeq < 1<<preDef.actualTableLog {
+		if debugEncoder {
+			println("Preferring predefined", predefSize>>3)
+		}
+		return preDef, compModePredefined, nil
 	}
 	if min(predefSize, prevSize) <= minNewSize(hist, nSeq) || forcePreDef {
 		if predefSize <= prevSize || forcePreDef {
