@@ -22,7 +22,9 @@ type fastBase struct {
 	tmp         [8]byte
 	blk         *blockEnc
 	lastDict    *dict
-	lowMem      bool
+	// histDict is the dictionary whose content starts hist, if any.
+	histDict *dict
+	lowMem   bool
 }
 
 // CRC returns the underlying CRC writer.
@@ -69,6 +71,7 @@ func (e *fastBase) addBlock(src []byte) int32 {
 			// Move down
 			offset := int32(len(e.hist)) - e.maxMatchOff
 			copy(e.hist[0:e.maxMatchOff], e.hist[offset:])
+			e.histDict = nil
 			e.cur += offset
 			e.hist = e.hist[:e.maxMatchOff]
 		}
@@ -98,6 +101,7 @@ func (e *fastBase) ensureHist(n int) {
 		l = int32(n)
 	}
 	e.hist = make([]byte, 0, l)
+	e.histDict = nil
 }
 
 // useBlock will replace the block with the provided one,
@@ -154,6 +158,7 @@ func (e *fastBase) resetBasePrefix(prefix []byte) {
 	}
 	e.hist = e.hist[:0]
 	e.hist = append(e.hist, prefix...)
+	e.histDict = nil
 }
 
 // Reset the encoding table.
@@ -185,16 +190,24 @@ func (e *fastBase) resetBase(d *dict, singleBlock bool) {
 	if e.cur < e.bufferReset {
 		e.cur += e.maxMatchOff + int32(len(e.hist))
 	}
-	e.hist = e.hist[:0]
-	if d != nil {
-		// Set offsets (currently not used)
-		for i, off := range d.offsets {
-			e.blk.recentOffsets[i] = uint32(off)
-			e.blk.prevRecentOffsets[i] = e.blk.recentOffsets[i]
-		}
-		// Transfer litenc.
-		e.blk.dictLitEnc = d.litEnc
-		e.blk.coders.seedPrevFromDict(d)
-		e.hist = append(e.hist, d.content...)
+	if d == nil {
+		e.hist = e.hist[:0]
+		e.histDict = nil
+		return
 	}
+	// Set offsets (currently not used)
+	for i, off := range d.offsets {
+		e.blk.recentOffsets[i] = uint32(off)
+		e.blk.prevRecentOffsets[i] = e.blk.recentOffsets[i]
+	}
+	// Transfer litenc.
+	e.blk.dictLitEnc = d.litEnc
+	e.blk.coders.seedPrevFromDict(d)
+	if e.histDict == d {
+		// Frames only append to hist, so the content is still at its start.
+		e.hist = e.hist[:len(d.content)]
+		return
+	}
+	e.hist = append(e.hist[:0], d.content...)
+	e.histDict = d
 }
