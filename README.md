@@ -2,8 +2,9 @@
 
 > [!NOTE]
 > **This is a fork of [klauspost/compress](https://github.com/klauspost/compress).**
-> Its `master` branch is upstream `master` with two zstd changes merged in
-> that are still under review upstream. Each lives on its own branch:
+> Its `master` branch is upstream `master` with these zstd changes merged in,
+> which are under review upstream or not yet sent. Each lives on its own
+> branch:
 >
 > * [`zstd-dict-small-blocks`](https://github.com/spotdemo4/compress/tree/zstd-dict-small-blocks)
 >   ([#1280](https://github.com/klauspost/compress/pull/1280)): faster and
@@ -20,6 +21,26 @@
 >   `WithDecoderDefaultDict` load a full zstd dictionary for frames that
 >   carry no ID, matching libzstd's `ZSTD_f_zstd1_magicless` and
 >   `--no-dictID`.
+> * [`zstd-dict-attach`](https://github.com/spotdemo4/compress/tree/zstd-dict-attach):
+>   frames that start from a dictionary no longer copy it. The dictionary
+>   content stays in the encoder's history between frames, and its match
+>   tables are built once and shared by all encoders at `SpeedFastest`,
+>   `SpeedDefault` and `SpeedBetterCompression`, so the cost of a frame no
+>   longer grows with the dictionary. Frame sizes change by -0.6% to +0.4%.
+>   Adds `BenchmarkDictRecords` for small messages with a dictionary.
+> * [`zstd-dict-asm-decode`](https://github.com/spotdemo4/compress/tree/zstd-dict-asm-decode):
+>   the assembly sequence decoder handles frames with a dictionary when
+>   there is no other history, as in `DecodeAll` of a single-block frame,
+>   instead of leaving them to the Go decoder.
+> * [`zstd-stream-dict-literals`](https://github.com/spotdemo4/compress/tree/zstd-stream-dict-literals)
+>   (on `zstd-dict-small-blocks`): streams that start from a dictionary use
+>   its literal table for their first block, and with concurrency also its
+>   sequence tables. Fixes a block reusing a Huffman table that was never
+>   written, which `zstd-dict-small-blocks` made likely in flushed streams.
+> * [`zstd-prefer-repeat`](https://github.com/spotdemo4/compress/tree/zstd-prefer-repeat)
+>   (on `zstd-stream-dict-literals`): at `SpeedFastest` and `SpeedDefault`,
+>   small blocks keep the previous literal and sequence tables when they fit,
+>   as libzstd's faster strategies do, instead of building new ones.
 >
 > Use it with a `replace` directive:
 > `go mod edit -replace github.com/klauspost/compress=github.com/spotdemo4/compress@master`.
