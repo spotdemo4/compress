@@ -1319,20 +1319,27 @@ func TestEncoderChooseCompWithDictTables(t *testing.T) {
 		t.Fatal("d0.dict not found")
 	}
 	for _, tc := range []struct {
-		name   string
-		table  tableIndex
-		counts map[uint8]uint32
-		want   seqCompMode
+		name         string
+		table        tableIndex
+		counts       map[uint8]uint32
+		want         seqCompMode
+		prefer, last bool
 	}{
 		// Final state flush makes the dictionary's larger table cost more.
-		{"ml-flush", tableMatchLengths, map[uint8]uint32{9: 1, 10: 1}, compModePredefined},
-		{"of-flush", tableOffsets, map[uint8]uint32{8: 1, 15: 1}, compModePredefined},
+		{"ml-flush", tableMatchLengths, map[uint8]uint32{9: 1, 10: 1}, compModePredefined, false, false},
+		{"of-flush", tableOffsets, map[uint8]uint32{8: 1, 15: 1}, compModePredefined, false, false},
 		// A new table beats a poorly fitting dictionary table on its exact header size.
-		{"ll-new", tableLiteralLengths, map[uint8]uint32{3: 1, 4: 5}, compModeFSE},
-		{"of-new", tableOffsets, map[uint8]uint32{0: 5, 3: 1}, compModeFSE},
+		{"ll-new", tableLiteralLengths, map[uint8]uint32{3: 1, 4: 5}, compModeFSE, false, false},
+		{"of-new", tableOffsets, map[uint8]uint32{0: 5, 3: 1}, compModeFSE, false, false},
 		// A fitting dictionary table is reused.
-		{"ml-repeat", tableMatchLengths, map[uint8]uint32{3: 1, 6: 1}, compModeRepeat},
-		{"of-repeat", tableOffsets, map[uint8]uint32{10: 1, 11: 1}, compModeRepeat},
+		{"ml-repeat", tableMatchLengths, map[uint8]uint32{3: 1, 6: 1}, compModeRepeat, false, false},
+		{"of-repeat", tableOffsets, map[uint8]uint32{10: 1, 11: 1}, compModeRepeat, false, false},
+		// Preferring repeat keeps the dictionary table for later blocks,
+		// unless it is the last block and predefined is cheaper.
+		{"ml-prefer", tableMatchLengths, map[uint8]uint32{9: 1, 10: 1}, compModeRepeat, true, false},
+		{"ml-prefer-last", tableMatchLengths, map[uint8]uint32{9: 1, 10: 1}, compModePredefined, true, true},
+		{"ll-prefer-last", tableLiteralLengths, map[uint8]uint32{3: 1, 4: 5}, compModeRepeat, true, true},
+		{"of-prefer", tableOffsets, map[uint8]uint32{0: 5, 3: 1}, compModeRepeat, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var blk blockEnc
@@ -1357,7 +1364,8 @@ func TestEncoderChooseCompWithDictTables(t *testing.T) {
 			}
 			cur.HistogramFinished(maxSym, maxCount)
 			blk.sequences = make([]seq, total)
-			_, got, err := blk.chooseComp(cur, prev, &fsePredefEnc[tc.table], maxSym)
+			blk.last = tc.last
+			_, got, err := blk.chooseComp(cur, prev, &fsePredefEnc[tc.table], maxSym, tc.prefer)
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -113,7 +113,7 @@ func (e *Encoder) compressJob(enc encoder, job *encJob) {
 		enc.Encode(blk, todo)
 		blk.last = len(data) == 0 && job.last
 
-		err := blk.encode(todo, e.o.noEntropy, !e.o.allLitEntropy)
+		err := blk.encode(todo, e.o.noEntropy, !e.o.allLitEntropy, e.o.preferRepeat())
 		if err != nil {
 			job.err = err
 			return

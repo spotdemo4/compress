@@ -440,6 +440,23 @@ func (b *blockEnc) dropUnwrittenTable(reUsed bool) {
 	}
 }
 
+// compressLits1X compresses lits as one stream. With preferRepeat, the
+// previous table is used without building a new one if it saves enough.
+// Otherwise the tables are compared as usual, and the previous table is
+// kept for later blocks.
+func (b *blockEnc) compressLits1X(lits []byte, preferRepeat bool) ([]byte, bool, error) {
+	if !preferRepeat || b.litEnc.Reuse != huff0.ReusePolicyAllow {
+		return huff0.Compress1X(lits, b.litEnc)
+	}
+	b.litEnc.Reuse = huff0.ReusePolicyMust
+	out, reUsed, err := huff0.Compress1X(lits, b.litEnc)
+	b.litEnc.Reuse = huff0.ReusePolicyAllow
+	if err == huff0.ErrIncompressible {
+		return huff0.Compress1X(lits, b.litEnc)
+	}
+	return out, reUsed, err
+}
+
 // encodeRLE will encode an RLE block.
 func (b *blockEnc) encodeRLE(val byte, length uint32) {
 	var bh blockHeader
@@ -489,7 +506,9 @@ func fuzzFseEncoder(data []byte) int {
 
 // encode will encode the block and append the output in b.output.
 // Previous offset codes must be pushed if more blocks are expected.
-func (b *blockEnc) encode(org []byte, raw, rawAllLits bool) error {
+// With preferRepeat, small blocks keep the previous tables when they can,
+// as zstd's faster strategies do, instead of building new ones.
+func (b *blockEnc) encode(org []byte, raw, rawAllLits, preferRepeat bool) error {
 	if len(b.sequences) == 0 {
 		return b.encodeLits(b.literals, rawAllLits)
 	}
@@ -537,7 +556,7 @@ func (b *blockEnc) encode(org []byte, raw, rawAllLits bool) error {
 	} else if len(b.literals) > 16 && !raw {
 		// Use 1 stream
 		single = true
-		out, reUsed, err = huff0.Compress1X(b.literals, b.litEnc)
+		out, reUsed, err = b.compressLits1X(b.literals, preferRepeat)
 	} else {
 		err = huff0.ErrIncompressible
 	}
@@ -624,15 +643,15 @@ func (b *blockEnc) encode(org []byte, raw, rawAllLits bool) error {
 		println("Encoding", len(b.sequences), "sequences")
 	}
 	b.genCodes()
-	llEnc, llMode, err := b.chooseComp(b.coders.llEnc, b.coders.llPrev, &fsePredefEnc[tableLiteralLengths], b.sequences[0].llCode)
+	llEnc, llMode, err := b.chooseComp(b.coders.llEnc, b.coders.llPrev, &fsePredefEnc[tableLiteralLengths], b.sequences[0].llCode, preferRepeat)
 	if err != nil {
 		return err
 	}
-	ofEnc, ofMode, err := b.chooseComp(b.coders.ofEnc, b.coders.ofPrev, &fsePredefEnc[tableOffsets], b.sequences[0].ofCode)
+	ofEnc, ofMode, err := b.chooseComp(b.coders.ofEnc, b.coders.ofPrev, &fsePredefEnc[tableOffsets], b.sequences[0].ofCode, preferRepeat)
 	if err != nil {
 		return err
 	}
-	mlEnc, mlMode, err := b.chooseComp(b.coders.mlEnc, b.coders.mlPrev, &fsePredefEnc[tableMatchLengths], b.sequences[0].mlCode)
+	mlEnc, mlMode, err := b.chooseComp(b.coders.mlEnc, b.coders.mlPrev, &fsePredefEnc[tableMatchLengths], b.sequences[0].mlCode, preferRepeat)
 	if err != nil {
 		return err
 	}
@@ -775,7 +794,10 @@ func (b *blockEnc) encode(org []byte, raw, rawAllLits bool) error {
 // chooseComp chooses the cheapest of RLE and the new, predefined and previous table.
 // rle is the code to use if all sequences have the same one.
 // The new table is only built if it could be the cheapest.
-func (b *blockEnc) chooseComp(cur, prev, preDef *fseEncoder, rle uint8) (*fseEncoder, seqCompMode, error) {
+// With preferRepeat, a previous table that can be used is kept for fewer
+// than 1000 sequences, like zstd's faster strategies, so later blocks can
+// still use it. Only the last block may pick the predefined table instead.
+func (b *blockEnc) chooseComp(cur, prev, preDef *fseEncoder, rle uint8, preferRepeat bool) (*fseEncoder, seqCompMode, error) {
 	nSeq := len(b.sequences)
 	if cur.maxCount == nSeq {
 		cur.setRLE(rle)
@@ -793,6 +815,12 @@ func (b *blockEnc) chooseComp(cur, prev, preDef *fseEncoder, rle uint8) (*fseEnc
 	}
 	if prevSize != math.MaxUint32 {
 		prevSize += uint32(prev.actualTableLog)
+		if preferRepeat && nSeq < 1000 && !forcePreDef && (!b.last || prevSize <= predefSize) {
+			if debugEncoder {
+				println("Preferring previous", prevSize>>3)
+			}
+			return prev, compModeRepeat, nil
+		}
 	}
 	if min(predefSize, prevSize) <= minNewSize(hist, nSeq) || forcePreDef {
 		if predefSize <= prevSize || forcePreDef {
