@@ -13,7 +13,9 @@
 >   counts a new table's header when choosing whether to reuse one. Encoding
 >   small messages with a matching dictionary is 19–49% faster at
 >   `SpeedFastest` with Go 1.27 (see the PR for Go 1.26), and frames are
->   1.5–17% smaller at every level.
+>   1.5–17% smaller at every level. Also fixes a block reusing a Huffman
+>   table that was never written, which reusing more often made likely in
+>   flushed dictionary streams.
 > * [`zstd-magicless-dictid`](https://github.com/spotdemo4/compress/tree/zstd-magicless-dictid)
 >   ([#1281](https://github.com/klauspost/compress/pull/1281)): magicless
 >   frames and frames without a dictionary ID. Adds `WithEncoderMagicless`,
@@ -26,21 +28,26 @@
 >   content stays in the encoder's history between frames, and its match
 >   tables are built once and shared by all encoders at `SpeedFastest`,
 >   `SpeedDefault` and `SpeedBetterCompression`, so the cost of a frame no
->   longer grows with the dictionary. Frame sizes change by -0.6% to +0.4%.
+>   longer grows with the dictionary. `EncodeAll` with a dictionary is
+>   29-47% faster per level with 32 KiB dictionaries and 42-89% with 110 KiB
+>   ones, on real records; frame sizes change by -0.9% to +0.4%.
 >   Adds `BenchmarkDictRecords` for small messages with a dictionary.
 > * [`zstd-dict-asm-decode`](https://github.com/spotdemo4/compress/tree/zstd-dict-asm-decode):
 >   the assembly sequence decoder handles frames with a dictionary when
 >   there is no other history, as in `DecodeAll` of a single-block frame,
->   instead of leaving them to the Go decoder.
+>   instead of leaving them to the Go decoder. `DecodeAll` with a dictionary
+>   is 16-33% faster.
 > * [`zstd-stream-dict-literals`](https://github.com/spotdemo4/compress/tree/zstd-stream-dict-literals)
 >   (on `zstd-dict-small-blocks`): streams that start from a dictionary use
 >   its literal table for their first block, and with concurrency also its
->   sequence tables. Fixes a block reusing a Huffman table that was never
->   written, which `zstd-dict-small-blocks` made likely in flushed streams.
+>   sequence tables. Flushed chunks are 2.5-3.4% smaller and streams 3-8% faster.
 > * [`zstd-prefer-repeat`](https://github.com/spotdemo4/compress/tree/zstd-prefer-repeat)
 >   (on `zstd-stream-dict-literals`): at `SpeedFastest` and `SpeedDefault`,
 >   small blocks keep the previous literal and sequence tables when they fit,
 >   as libzstd's faster strategies do, instead of building new ones.
+>   `EncodeAll` is 15-19% faster at `SpeedFastest` and streams 11-21% faster;
+>   frames grow by at most 0.6%, but 64-byte flushed chunks of some data are
+>   up to 8% larger.
 >
 > Use it with a `replace` directive:
 > `go mod edit -replace github.com/klauspost/compress=github.com/spotdemo4/compress@master`.
