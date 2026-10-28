@@ -1178,6 +1178,121 @@ func TestEncoderDictSeedsSequenceTables(t *testing.T) {
 	}
 }
 
+// TestEncoderDictStreamFirstBlock checks that the first flushed block of a
+// stream starts from the dictionary's tables: its literals are encoded as by
+// EncodeAll, and the same with and without concurrency.
+func TestEncoderDictStreamFirstBlock(t *testing.T) {
+	zr := testCreateZipReader("testdata/dict-tests-small.zip", t)
+	dicts := readDicts(t, zr)
+	dec, err := NewReader(nil, WithDecoderConcurrency(1), WithDecoderDicts(dicts...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	// firstBlock returns the first block of frame, without its header,
+	// or nil if it is not compressed.
+	firstBlock := func(frame []byte) []byte {
+		fd := newFrameDec(decoderOptions{maxWindowSize: MaxWindowSize, maxDecodedSize: MaxWindowSize})
+		br := byteBuf(frame)
+		if err := fd.reset(&br); err != nil {
+			t.Fatal(err)
+		}
+		if len(br) < 4 || blockType(br[0]>>1&3) != blockTypeCompressed {
+			return nil
+		}
+		return br[3:][:int(br[0])>>3|int(br[1])<<5|int(br[2])<<13]
+	}
+	var samples [][]byte
+	for _, tt := range zr.File {
+		if !strings.HasSuffix(tt.Name, ".zst") {
+			continue
+		}
+		r, err := tt.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		in, err := io.ReadAll(r)
+		r.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded, err := dec.DecodeAll(in, nil); err == nil && len(decoded) >= 64 && len(decoded) <= 4096 {
+			samples = append(samples, decoded)
+		}
+	}
+	if len(samples) == 0 {
+		t.Fatal("no samples")
+	}
+	for i, dict := range dicts {
+		for level := SpeedFastest; level < speedLast; level++ {
+			t.Run(fmt.Sprintf("dict-%d/%s", i, level), func(t *testing.T) {
+				var out [2]bytes.Buffer
+				var encs [2]*Encoder
+				for c := range encs {
+					var err error
+					encs[c], err = NewWriter(&out[c], WithEncoderLevel(level), WithEncoderConcurrency(c+1), WithEncoderDict(dict))
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				var treeless int
+				for _, m := range samples {
+					var blocks [2][]byte
+					for c, enc := range encs {
+						out[c].Reset()
+						enc.Reset(&out[c])
+						if _, err := enc.Write(m); err != nil {
+							t.Fatal(err)
+						}
+						if err := enc.Flush(); err != nil {
+							t.Fatal(err)
+						}
+						blocks[c] = firstBlock(out[c].Bytes())
+						if err := enc.Close(); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if !bytes.Equal(blocks[0], blocks[1]) {
+						t.Errorf("%d byte message: first block differs with concurrency", len(m))
+					}
+					want := firstBlock(encs[0].EncodeAll(m, nil))
+					if (want == nil) != (blocks[0] == nil) || want != nil && want[0]&3 != blocks[0][0]&3 {
+						t.Errorf("%d byte message: stream and EncodeAll literals differ", len(m))
+					}
+					if want != nil && literalsBlockType(want[0]&3) == literalsBlockTreeless {
+						treeless++
+					}
+				}
+				t.Log(treeless, "of", len(samples), "use the dictionary's literal table")
+
+				// A stream whose first block leaves the dictionary's table
+				// unused must not use it after a block with a new table.
+				for c, enc := range encs {
+					out[c].Reset()
+					enc.Reset(&out[c])
+					want := bytes.Clone(samples[0][:64])
+					rand.New(rand.NewSource(1)).Read(want)
+					for _, m := range append([][]byte{want}, samples...) {
+						if _, err := enc.Write(m); err != nil {
+							t.Fatal(err)
+						}
+						if err := enc.Flush(); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := enc.Close(); err != nil {
+						t.Fatal(err)
+					}
+					want = append(want, bytes.Join(samples, nil)...)
+					if got, err := dec.DecodeAll(out[c].Bytes(), nil); err != nil || !bytes.Equal(got, want) {
+						t.Fatalf("concurrency %d stream: %v", c+1, err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestEncoderChooseCompWithDictTables(t *testing.T) {
 	initPredefined()
 	zr := testCreateZipReader("testdata/dict-tests-small.zip", t)

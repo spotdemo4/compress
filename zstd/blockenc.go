@@ -94,7 +94,6 @@ func (b *blockEnc) reset(prev *blockEnc) {
 	if prev != nil {
 		b.recentOffsets = prev.prevRecentOffsets
 	}
-	b.dictLitEnc = nil
 }
 
 // reset will reset the block for a new encode, but in the same stream,
@@ -102,7 +101,9 @@ func (b *blockEnc) reset(prev *blockEnc) {
 // If a previous block is provided, the recent offsets are carried over.
 func (b *blockEnc) swapEncoders(prev *blockEnc) {
 	b.coders.swap(&prev.coders)
+	// A dictionary table not used yet goes with the literal encoder.
 	b.litEnc, prev.litEnc = prev.litEnc, b.litEnc
+	b.dictLitEnc, prev.dictLitEnc = prev.dictLitEnc, b.dictLitEnc
 }
 
 // blockHeader contains the information for a block header.
