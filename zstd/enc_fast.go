@@ -160,6 +160,8 @@ encodeLoop:
 		// We will not use repeat offsets across blocks.
 		// By not using them for the first 3 matches
 		canRepeat := len(blk.sequences) > 2
+		// Offsets from before the block are only repeated after a match.
+		canRepeat2 := blk.offsetsValid || canRepeat
 
 		for {
 			if debugAsserts && canRepeat && offset1 == 0 {
@@ -293,7 +295,7 @@ encodeLoop:
 		cv = load6432(src, s)
 
 		// Check offset 2
-		if o2 := s - offset2; canRepeat && load3232(src, o2) == uint32(cv) {
+		if o2 := s - offset2; canRepeat2 && o2 >= 0 && load3232(src, o2) == uint32(cv) {
 			// We have at least 4 byte match.
 			// No need to check backwards. We come straight from a match
 			l := 4 + e.matchlen(s+4, o2+4, src)
@@ -666,6 +668,8 @@ encodeLoop:
 		// We will not use repeat offsets across blocks.
 		// By not using them for the first 3 matches
 		canRepeat := len(blk.sequences) > 2
+		// Offsets from before the block are only repeated after a match.
+		canRepeat2 := blk.offsetsValid || canRepeat
 
 		for {
 			if debugAsserts && canRepeat && offset1 == 0 {
@@ -812,7 +816,7 @@ encodeLoop:
 		cv = load6432(src, s)
 
 		// Check offset 2
-		if o2 := s - offset2; canRepeat && load3232(src, o2) == uint32(cv) {
+		if o2 := s - offset2; canRepeat2 && o2 >= 0 && load3232(src, o2) == uint32(cv) {
 			// We have at least 4 byte match.
 			// No need to check backwards. We come straight from a match
 			l := 4 + e.matchlen(s+4, o2+4, src)

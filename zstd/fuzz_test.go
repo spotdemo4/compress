@@ -196,6 +196,8 @@ func FuzzEncoding(f *testing.F) {
 	// Magicless, without dictionary ID.
 	var encsML [SpeedBestCompression + 1]*Encoder
 	var decsML [SpeedBestCompression + 1]*Decoder
+	// Synchronous, without and with a dictionary.
+	var encsSync [SpeedBestCompression + 1][2]*Encoder
 
 	var dicts [][]byte
 	if testDicts {
@@ -228,6 +230,10 @@ func FuzzEncoding(f *testing.F) {
 				if err != nil {
 					panic(err)
 				}
+				encsSync[level][1], err = NewWriter(nil, WithEncoderLevel(level), WithEncoderConcurrency(1), WithWindowSize(64<<10), WithEncoderDict(dicts[int(level)%len(dicts)]))
+			}
+			if err == nil {
+				encsSync[level][0], err = NewWriter(nil, WithEncoderLevel(level), WithEncoderConcurrency(1), WithWindowSize(64<<10))
 			}
 		}
 		return func() {
@@ -321,6 +327,30 @@ func FuzzEncoding(f *testing.F) {
 				}
 				if !bytes.Equal(got, data) {
 					t.Fatal(fmt.Sprintln("Level", level, "DecodeAll (buffer) output mismatch\n", len(got), "org: \n", len(data), "(want)", "\nencoded:", len(encoded2)))
+				}
+			}
+			// Synchronous streams written in flushed pieces, which repeat
+			// offsets from earlier blocks.
+			for _, enc := range encsSync[level] {
+				if enc == nil {
+					continue
+				}
+				dst.Reset()
+				enc.Reset(&dst)
+				for todo, piece := data, 1+bufSize%1024; len(todo) > 0; todo = todo[min(piece, len(todo)):] {
+					if _, err := enc.Write(todo[:min(piece, len(todo))]); err != nil {
+						t.Fatal(err)
+					}
+					if err := enc.Flush(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := enc.Close(); err != nil {
+					t.Fatal(err)
+				}
+				got, err = dec.DecodeAll(dst.Bytes(), got[:0])
+				if err != nil || !bytes.Equal(got, data) {
+					t.Fatal(fmt.Sprintln("Level", level, "synchronous stream:", err, len(got), "want:", len(data)))
 				}
 			}
 			if !testDicts {

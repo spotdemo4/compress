@@ -238,6 +238,8 @@ encodeLoop:
 		var t int32
 		// We allow the encoder to optionally turn off repeat offsets across blocks
 		canRepeat := len(blk.sequences) > 2
+		// Offsets from before the block are only repeated after a match.
+		canRepeat2 := blk.offsetsValid || canRepeat
 		var matched, index0 int32
 
 		for {
@@ -591,14 +593,14 @@ encodeLoop:
 		}
 
 		cv = load6432(src, s)
-		if !canRepeat {
+		if !canRepeat2 {
 			continue
 		}
 
 		// Check offset 2
 		for {
 			o2 := s - offset2
-			if load3232(src, o2) != uint32(cv) {
+			if o2 < 0 || load3232(src, o2) != uint32(cv) {
 				// Do regular search
 				break
 			}
@@ -759,6 +761,8 @@ encodeLoop:
 		var t int32
 		// We allow the encoder to optionally turn off repeat offsets across blocks
 		canRepeat := len(blk.sequences) > 2
+		// Offsets from before the block are only repeated after a match.
+		canRepeat2 := blk.offsetsValid || canRepeat
 		var matched, index0 int32
 
 		for {
@@ -1130,14 +1134,14 @@ encodeLoop:
 		}
 
 		cv = load6432(src, s)
-		if !canRepeat {
+		if !canRepeat2 {
 			continue
 		}
 
 		// Check offset 2
 		for {
 			o2 := s - offset2
-			if load3232(src, o2) != uint32(cv) {
+			if o2 < 0 || load3232(src, o2) != uint32(cv) {
 				// Do regular search
 				break
 			}
