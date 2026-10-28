@@ -27,6 +27,9 @@ type blockEnc struct {
 	output            []byte
 	recentOffsets     [3]uint32
 	prevRecentOffsets [3]uint32
+	// offsetsValid is set when recentOffsets are the decoder's at the start
+	// of the block, so the encoder can repeat them from its first sequence.
+	offsetsValid bool
 
 	last   bool
 	lowMem bool
@@ -76,6 +79,7 @@ func (b *blockEnc) init() {
 // initNewEncode can be used to reset offsets and encoders to the initial state.
 func (b *blockEnc) initNewEncode() {
 	b.recentOffsets = [3]uint32{1, 4, 8}
+	b.offsetsValid = true
 	b.litEnc.Reuse = huff0.ReusePolicyNone
 	b.coders.setPrev(nil, nil, nil)
 	b.dictLitEnc = nil
@@ -92,7 +96,9 @@ func (b *blockEnc) reset(prev *blockEnc) {
 	b.output = b.output[:0]
 	b.last = false
 	if prev != nil {
+		// prev may still fall back to a raw block after this one starts.
 		b.recentOffsets = prev.prevRecentOffsets
+		b.offsetsValid = false
 	}
 	b.dictLitEnc = nil
 }
@@ -487,6 +493,7 @@ func (b *blockEnc) encode(org []byte, raw, rawAllLits bool) error {
 		seq := b.sequences[0]
 		if seq.litLen == uint32(len(b.literals)) && seq.offset-3 == 1 {
 			// Offset == 1 and 0 or 1 literals.
+			b.popOffsets()
 			b.encodeRLE(org[0], b.sequences[0].matchLen+zstdMinMatch+seq.litLen)
 			return nil
 		}

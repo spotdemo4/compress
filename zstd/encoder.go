@@ -375,6 +375,8 @@ func (e *Encoder) nextBlock(final bool) error {
 		enc := s.encoder
 		blk := enc.Block()
 		blk.reset(nil)
+		// Keep the offsets for a block that is not compressed.
+		blk.pushOffsets()
 		enc.Encode(blk, src)
 		blk.last = final
 		if final {

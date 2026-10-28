@@ -90,6 +90,8 @@ func (e *Encoder) compressJob(enc encoder, job *encJob) {
 	} else {
 		enc.Reset(nil, false)
 	}
+	// A job cannot know the offsets the decoder has when it starts.
+	enc.Block().offsetsValid = false
 
 	data := job.input
 	if len(data) == 0 && job.last {
