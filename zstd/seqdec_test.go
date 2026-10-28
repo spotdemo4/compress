@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -845,6 +846,77 @@ func testCreateZipReader(path string, tb testing.TB) *zip.Reader {
 	failOnError(err)
 
 	return zr
+}
+
+// TestDecoderDictMatches round-trips frames whose matches reach into the
+// dictionary in the ways the assembly decoder must handle when it decodes
+// from the dictionary as the history: at its first byte, across its end into
+// the output, and far beyond the window of a small single-segment frame. The
+// assembly and Go decoders and the streaming decoder must agree.
+func TestDecoderDictMatches(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	randomBytes := func(n int) []byte {
+		b := make([]byte, n)
+		rng.Read(b)
+		return b
+	}
+	dict := randomBytes(64 << 10)
+	const id = 1
+	start := randomBytes(20)
+	tests := []struct {
+		name  string
+		input []byte
+		// saved is how much smaller the frame must be than without the
+		// dictionary.
+		saved int
+	}{
+		{"first-byte", slices.Concat(dict[:200], randomBytes(50)), 150},
+		{"far-small-frame", slices.Concat(randomBytes(30), dict[1000:1200], randomBytes(30)), 150},
+		// One match copies the dictionary's last 40 bytes and the first
+		// 20 of the output, which match 20 bytes without the dictionary.
+		{"across-end", slices.Concat(start, randomBytes(80), dict[len(dict)-40:], start, randomBytes(40)), 30},
+		{"many-blocks", bytes.Repeat(slices.Concat(dict[5000:5100], randomBytes(50), dict[60000:60300]), 1000), 300},
+	}
+	dec, err := NewReader(nil, WithDecoderConcurrency(1), WithDecoderDictRaw(id, dict))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	for _, tc := range tests {
+		for _, level := range []EncoderLevel{SpeedFastest, SpeedBetterCompression} {
+			t.Run(tc.name+"/"+level.String(), func(t *testing.T) {
+				enc, err := NewWriter(nil, WithEncoderLevel(level), WithEncoderDictRaw(id, dict))
+				if err != nil {
+					t.Fatal(err)
+				}
+				compressed := enc.EncodeAll(tc.input, nil)
+				noDict, err := NewWriter(nil, WithEncoderLevel(level))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n := len(noDict.EncodeAll(tc.input, nil)); len(compressed) > n-tc.saved {
+					t.Fatalf("%d bytes compressed to %d, %d without the dictionary: the matches into it are missing", len(tc.input), len(compressed), n)
+				}
+				got, err := dec.DecodeAll(compressed, nil)
+				if err != nil || !bytes.Equal(got, tc.input) {
+					t.Fatalf("DecodeAll: %v", err)
+				}
+				decodeSyncGoOnly = true
+				got, err = dec.DecodeAll(compressed, nil)
+				decodeSyncGoOnly = false
+				if err != nil || !bytes.Equal(got, tc.input) {
+					t.Fatalf("DecodeAll (Go): %v", err)
+				}
+				if err := dec.Reset(bytes.NewReader(compressed)); err != nil {
+					t.Fatal(err)
+				}
+				got, err = io.ReadAll(dec)
+				if err != nil || !bytes.Equal(got, tc.input) {
+					t.Fatalf("streaming decode: %v", err)
+				}
+			})
+		}
+	}
 }
 
 // TestDecoderShortSequenceCopies round-trips inputs built so that their
